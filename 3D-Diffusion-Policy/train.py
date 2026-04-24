@@ -537,10 +537,9 @@ class TrainDP3Workspace:
         # load the latest checkpoint
         print("Hellooooooo")
         cfg = copy.deepcopy(self.cfg)
-        
-        lastest_ckpt_path = "/home/varun-edachali/Research/RRC/policy/3D-Diffusion-Policy/3D-Diffusion-Policy/data/outputs/epoch=0950.ckpt"
+        lastest_ckpt_path = "/scratch2/cross-emb/DP3_outputs/2026.04.16/21.18.38_train_dp3_motionplan_test/checkpoints/epoch=0200-test_mean_score=0.500.ckpt"
         print(f"Checkpoint is loaded from : {lastest_ckpt_path}")
-        
+
         self.load_checkpoint(path=lastest_ckpt_path)
 
         # Load dataset
@@ -579,6 +578,9 @@ class TrainDP3Workspace:
         )
         assert isinstance(env_runner, BaseRunner)
 
+        if hasattr(env_runner, "env_test") and hasattr(env_runner.env_test, "env") and hasattr(env_runner.env_test.env, "show_goal_marker"):
+            env_runner.env_test.env.show_goal_marker = True
+
         # Eval mode: save all rollout videos locally (cam0+cam1 merged), do not upload videos to wandb.
         if hasattr(env_runner, "save_local_videos"):
             env_runner.save_local_videos = True
@@ -610,6 +612,7 @@ class TrainDP3Workspace:
                 
                 # Get predictions
                 result = policy.predict_action(obs_dict)
+                
                 pred_action = result["action_pred"]  # Shape: (B, T, action_dim)
                 
                 # Move to CPU and convert to numpy

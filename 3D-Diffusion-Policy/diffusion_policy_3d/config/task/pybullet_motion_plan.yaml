@@ -18,8 +18,8 @@ shape_meta: &shape_meta
 
 env_runner:
   _target_: diffusion_policy_3d.env_runner.pybullet_runner.Lite6MotionPlanningRunner
-  n_test: 10
-  max_steps: 350
+  n_test: 8
+  max_steps: 650
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
   fps: 10
@@ -31,11 +31,12 @@ env_runner:
   success_threshold: 0.08
   max_steps_per_waypoint: 2
   waypoint_threshold: 0.01
-  urdf_path: null
+  collision_distance_threshold : 0.01
+
 
 dataset:
   _target_: diffusion_policy_3d.dataset.motion_plan_dataset.MotionPlanDataset
-  zarr_path: /home/nitin/Desktop/Research/robot-sim/rrc_sim_dataset_mp.zarr
+  zarr_path: /scratch2/cross-emb/robot-sim/rrc_sim_dataset_mp.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

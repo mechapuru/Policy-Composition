@@ -600,10 +600,10 @@ class Lite6MotionPlanningRunner(BaseRunner):
         image_size=224,
         action_dim=7,
         collision_terminate=False,
+        collision_distance_threshold=0.01,
         success_threshold=0.03,
         max_steps_per_waypoint=10,
         waypoint_threshold=0.01,
-        urdf_path=None,
         log_wandb_videos=True,
         save_local_videos=False,
         save_all_local_episodes=False,
@@ -631,8 +631,8 @@ class Lite6MotionPlanningRunner(BaseRunner):
                 image_size=image_size,
                 action_dim=action_dim,
                 max_steps=max_steps,
-                urdf_path=urdf_path,
                 collision_terminate=collision_terminate,
+                collision_distance_threshold=collision_distance_threshold,
                 success_threshold=success_threshold,
                 max_steps_per_waypoint=max_steps_per_waypoint,
                 waypoint_threshold=waypoint_threshold,
@@ -673,10 +673,43 @@ class Lite6MotionPlanningRunner(BaseRunner):
             writer.release()
         return True
 
-    def _save_local_episode_videos(self, episode_id, cam0_frames, cam1_frames, collided):
+    def _overlay_text(self, frame, text, org=(12, 28)):
+        annotated = frame.copy()
+        cv2.putText(
+            annotated,
+            text,
+            org,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated,
+            text,
+            org,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return annotated
+
+    def _annotate_frames_with_final_error(self, frames, final_goal_dist):
+        if len(frames) == 0 or final_goal_dist is None:
+            return frames
+        text = f"Final EEF error: {final_goal_dist:.3f} m"
+        return [self._overlay_text(frame, text) for frame in frames]
+
+    def _save_local_episode_videos(self, episode_id, cam0_frames, cam1_frames, collided, final_goal_dist=None):
         out_dir = os.path.join(self.output_dir, self.local_video_dir)
         os.makedirs(out_dir, exist_ok=True)
         collision_tag = "collision" if collided else "non_collision"
+
+        cam0_frames = self._annotate_frames_with_final_error(cam0_frames, final_goal_dist)
+        cam1_frames = self._annotate_frames_with_final_error(cam1_frames, final_goal_dist)
 
         if self.merge_cams_side_by_side:
             merged_frames = [
@@ -702,6 +735,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
         all_success_rates_test = []
         all_collision_rates_test = []
         saved_local_videos = []
+        final_goal_dists = []
 
         cam0_first_episode = []
         cam1_first_episode = []
@@ -712,7 +746,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
 
             reward_sum = 0.0
             done = False
-            step_id = 0
+            final_goal_dist = None
 
             collect_frames = self.save_local_videos or (self.log_wandb_videos and episode_id == 0)
             episode_cam0_frames = []
@@ -721,7 +755,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
                 episode_cam0_frames.append(self.env_test.env.render_camera(0))
                 episode_cam1_frames.append(self.env_test.env.render_camera(1))
 
-            while (not done) and (step_id < self.max_steps):
+            while not done:
                 policy_obs = self._to_policy_obs(obs, policy, device)
 
                 with torch.no_grad():
@@ -736,7 +770,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
                 action_seq = action[: self.n_action_steps]
                 obs, reward, done, info = self.env_test.step(action_seq)
                 reward_sum += float(reward)
-                step_id += int(action_seq.shape[0])
+                final_goal_dist = float(info.get("goal_dist", final_goal_dist))
 
                 if collect_frames:
                     episode_cam0_frames.append(self.env_test.env.render_camera(0))
@@ -745,10 +779,11 @@ class Lite6MotionPlanningRunner(BaseRunner):
             all_returns_test.append(reward_sum)
             all_success_rates_test.append(1.0 if self.env_test.env.is_success() else 0.0)
             all_collision_rates_test.append(1.0 if self.env_test.env.collision_flag else 0.0)
+            final_goal_dists.append(final_goal_dist)
 
             if self.log_wandb_videos and episode_id == 0 and len(episode_cam0_frames) > 0:
-                cam0_first_episode = episode_cam0_frames
-                cam1_first_episode = episode_cam1_frames
+                cam0_first_episode = self._annotate_frames_with_final_error(episode_cam0_frames, final_goal_dist)
+                cam1_first_episode = self._annotate_frames_with_final_error(episode_cam1_frames, final_goal_dist)
 
             if self.save_local_videos and len(episode_cam0_frames) > 0:
                 if self.save_all_local_episodes or (episode_id == 0):
@@ -757,6 +792,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
                         cam0_frames=episode_cam0_frames,
                         cam1_frames=episode_cam1_frames,
                         collided=self.env_test.env.collision_flag,
+                        final_goal_dist=final_goal_dist,
                     )
                     saved_local_videos.extend(saved_paths)
 
@@ -768,6 +804,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
         sr_mean = float(np.mean(all_success_rates_test)) if len(all_success_rates_test) > 0 else 0.0
         returns_mean = float(np.mean(all_returns_test)) if len(all_returns_test) > 0 else 0.0
         collision_mean = float(np.mean(all_collision_rates_test)) if len(all_collision_rates_test) > 0 else 0.0
+        final_goal_dist_mean = float(np.mean([d for d in final_goal_dists if d is not None])) if any(d is not None for d in final_goal_dists) else None
         self.logger_util_test.record(sr_mean)
 
         log_data = {
@@ -777,6 +814,9 @@ class Lite6MotionPlanningRunner(BaseRunner):
             "SR_test_L3": self.logger_util_test.average_of_largest_K(),
             "test_mean_score": sr_mean,
         }
+
+        if final_goal_dist_mean is not None:
+            log_data["mean_final_goal_dist_test"] = final_goal_dist_mean
 
         if len(saved_local_videos) > 0:
             cprint(f"Saved {len(saved_local_videos)} rollout videos to {os.path.join(self.output_dir, self.local_video_dir)}", "cyan")

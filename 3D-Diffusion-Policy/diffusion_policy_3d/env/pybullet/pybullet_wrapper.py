@@ -887,6 +887,16 @@ def create_static_box(position, half_extents, yaw=0.0, color=[0.8, 0.3, 0.3, 1])
     )
 
 
+def create_static_sphere(position, radius, color=[0.2, 0.9, 0.2, 1.0]):
+    visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=radius, rgbaColor=color)
+    return p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=visual_shape,
+        basePosition=position,
+    )
+
+
 def generate_task_obstacles(start_pos, goal_pos, obs_config):
     obstacles = []
     p_start = np.array(start_pos, dtype=np.float32)
@@ -938,13 +948,13 @@ class Lite6Robot:
         self.arm_num_dofs = 6
         # Lite6 rest poses - keeping similar to XArm for now, can be tuned
         self.arm_rest_poses = [0.0, -1.57, 1.57, 0.0, 0.0, 0.0] 
-        self.gripper_range = [-0.04, 0.0] # Prismatic gripper, -0.04=Open, 0.0=Closed
+        self.gripper_range = [-0.04, -0.028] # Prismatic gripper, -0.04=Open, -0.028=Grasp
         self.max_velocity = 3
-        self.urdf_path = "./lite-6-updated-urdf/lite_6_new.urdf"
+        self.urdf_path = "/home/cross-emb/nitin_exp/dp3_motion/3D-Diffusion-Policy/diffusion_policy_3d/env/pybullet/lite-6-updated-urdf/lite_6_new.urdf"
 
     def load(self):
         self.id = p.loadURDF(
-            "./lite-6-updated-urdf/lite_6_new.urdf",
+            self.urdf_path,
             self.base_pos,
             self.base_ori,
             useFixedBase=True,
@@ -1117,13 +1127,33 @@ class Lite6Robot:
                         -0.04 = Open (fingers apart)
                         -0.024 = Grasp (5cm box)
         """
-        p.resetJointState(self.id, self.mimic_parent_id, open_angle)
+        prismatic_target = float(np.clip(open_angle, self.gripper_range[0], self.gripper_range[1]))
 
-        for joint_id, multiplier in self.mimic_child_multiplier.items():
-            p.resetJointState(self.id, joint_id, open_angle * multiplier)
+        max_iters = 100
+        for _ in range(max_iters):
+            p.setJointMotorControl2(
+                self.id,
+                self.mimic_parent_id,
+                p.POSITION_CONTROL,
+                targetPosition=prismatic_target,
+                force=500,
+            )
 
-        for _ in range(10):
+            for joint_id, multiplier in self.mimic_child_multiplier.items():
+                child_target = prismatic_target * multiplier
+                p.setJointMotorControl2(
+                    self.id,
+                    joint_id,
+                    p.POSITION_CONTROL,
+                    targetPosition=child_target,
+                    force=500,
+                )
+
             p.stepSimulation()
+
+            current_pos = p.getJointState(self.id, self.mimic_parent_id)[0]
+            if abs(current_pos - prismatic_target) < 2e-3:
+                break
 
     def reset_posture(self):
         """Robustly reset the robot to the initial pose and gripper open."""
@@ -1212,8 +1242,8 @@ class Lite6MotionPlanningEnv(gym.Env):
         image_size=224,
         action_dim=7,
         max_steps=350,
-        urdf_path=None,
         collision_terminate=False,
+        collision_distance_threshold=0.01,
         success_threshold=0.03,
         obs_config=None,
         max_steps_per_waypoint=10,
@@ -1226,6 +1256,7 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.max_steps = max_steps
         self.current_step = 0
         self.collision_terminate = collision_terminate
+        self.collision_distance_threshold = max(0.0, float(collision_distance_threshold))
         self.success_threshold = success_threshold
         self.obs_config = obs_config or {}
         self.max_steps_per_waypoint = max_steps_per_waypoint
@@ -1238,12 +1269,28 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
         self.table_id = p.loadURDF("table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0]))
 
-        self.robot = Lite6Robot([0, 0, 0.62], [0, 0, 0], urdf_path=urdf_path)
+        self.robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
         self.robot.load()
+        self.goal_marker_id = None
+        for i in range(p.getNumJoints(self.robot.id)):
+            joint_info = p.getJointInfo(self.robot.id, i)
+            # index 1 is the joint name, index 12 is the child link name
+            link_name = joint_info[12].decode('utf-8') 
+            if link_name == "tcp":
+                tcp_link_index = i
+                print(f"Found TCP link '{link_name}' at index {tcp_link_index}")
+                break
+
+        if tcp_link_index != -1:
+            self.robot.eef_id = tcp_link_index
+        
 
         self.goal_eef_xyz = np.array([0.3, 0.0, 0.8], dtype=np.float32)
         self.start_eef_xyz = np.array([0.25, -0.2, 0.75], dtype=np.float32)
         self.target_orn = p.getQuaternionFromEuler([-1.5708, 0, 1.5708])
+        self.show_goal_marker = True
+        self.goal_marker_radius = 0.015
+        self.goal_marker_color = [0.1, 0.9, 0.1, 1.0]
         self.obstacle_ids = []
         self.collision_flag = False
         self.is_success_flag = False
@@ -1281,6 +1328,8 @@ class Lite6MotionPlanningEnv(gym.Env):
     def _build_point_cloud(self):
         merged = []
         exclude_ids = {self.table_id, self.plane_id}
+        if self.goal_marker_id is not None:
+            exclude_ids.add(self.goal_marker_id)
         for cam_cfg in _LITE6_MP_CAMERAS:
             rgb, depth, seg, view_matrix, proj_matrix = self._capture_camera(cam_cfg)
             self.last_cam_frames[cam_cfg["name"]] = rgb
@@ -1312,12 +1361,26 @@ class Lite6MotionPlanningEnv(gym.Env):
 
     def _check_collision(self):
         for body_id in [self.table_id] + list(self.obstacle_ids):
-            contacts = p.getContactPoints(self.robot.id, body_id)
-            for contact in contacts:
-                robot_link = contact[3]
-                if robot_link == -1:
-                    continue
-                return True
+            if self.collision_distance_threshold <= 0.0:
+                contacts = p.getContactPoints(self.robot.id, body_id)
+                for contact in contacts:
+                    robot_link = contact[3]
+                    if robot_link == -1:
+                        continue
+                    return True
+            else:
+                closest_points = p.getClosestPoints(
+                    self.robot.id,
+                    body_id,
+                    distance=self.collision_distance_threshold,
+                )
+                for point in closest_points:
+                    robot_link = point[3]
+                    if robot_link == -1:
+                        continue
+                    # point[8] is distance in meters; it can be negative for penetration.
+                    if point[8] <= self.collision_distance_threshold:
+                        return True
         return False
 
     def _get_obs(self):
@@ -1330,6 +1393,32 @@ class Lite6MotionPlanningEnv(gym.Env):
             "goal_eef_xyz": self.goal_eef_xyz.astype(np.float32),
             "image": cam0.transpose(2, 0, 1).astype(np.uint8),
         }
+
+    def _dataset_gripper_to_joint(self, gripper_cmd):
+        """Map dataset gripper command [0, 1] to Lite6 finger joint [-0.04, 0.0]."""
+        cmd = float(np.clip(gripper_cmd, 0.0, 1.0))
+        open_joint = self.robot.gripper_range[0]   # -0.04 (open)
+        close_joint = self.robot.gripper_range[1]  # 0.0 (closed)
+        return open_joint + cmd * (close_joint - open_joint)
+
+    def _clear_goal_marker(self):
+        if self.goal_marker_id is None:
+            return
+        try:
+            p.removeBody(self.goal_marker_id)
+        except Exception:
+            pass
+        self.goal_marker_id = None
+
+    def _update_goal_marker(self):
+        self._clear_goal_marker()
+        if not self.show_goal_marker:
+            return
+        self.goal_marker_id = create_static_sphere(
+            position=self.goal_eef_xyz.astype(np.float32).tolist(),
+            radius=self.goal_marker_radius,
+            color=self.goal_marker_color,
+        )
 
     def reset(self, start_joint=None, goal_eef_xyz=None, cube_start_pos=None, cube_start_orn=None):
         del start_joint, cube_start_pos, cube_start_orn
@@ -1347,11 +1436,14 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.robot.reset_posture()
 
         self.start_eef_xyz = np.array([0.25, -0.2, 0.75], dtype=np.float32)
+
         self.goal_eef_xyz = np.array([
             0.35 + np.random.uniform(-0.05, 0.0),
             0.20 + np.random.uniform(-0.05, 0.05),
             0.75 + float(np.random.uniform(-0.05, 0.2, size=1)[0]),
         ], dtype=np.float32)
+
+        self._update_goal_marker()
 
         self.obstacle_ids = generate_task_obstacles(
             self.start_eef_xyz.tolist(),
@@ -1380,7 +1472,8 @@ class Lite6MotionPlanningEnv(gym.Env):
                 targetPosition=start_joint_target[i],
                 force=1000,
             )
-        self.robot.move_gripper(0.0)
+        # Dataset convention: 0=open, 1=close.
+        self.robot.move_gripper(self._dataset_gripper_to_joint(0.0))
         for _ in range(120):
             p.stepSimulation()
 
@@ -1393,9 +1486,10 @@ class Lite6MotionPlanningEnv(gym.Env):
             raise ValueError(f"Lite6MotionPlanningEnv expects 7D action, got {action.shape}")
 
         target_arm = action[:6]
-        gripper_delta = float(action[6])
-
-        self.robot.move_gripper(gripper_delta)
+        gripper_cmd_dataset = float(action[6])
+        current_gripper_pos = self.robot.get_robot_state()[-1]  # Last element is gripper state [0, 1]
+        gripper_target_joint = self._dataset_gripper_to_joint(current_gripper_pos+gripper_cmd_dataset)
+        self.robot.move_gripper(gripper_target_joint)
 
         collided = False
         for _ in range(self.max_steps_per_waypoint):
@@ -1428,7 +1522,7 @@ class Lite6MotionPlanningEnv(gym.Env):
 
         self.collision_flag = self.collision_flag or collided
 
-        eef_pos = self.robot.get_eef_position()
+        eef_pos = self.robot.get_current_ee_position()[0]
         goal_dist = float(np.linalg.norm(eef_pos - self.goal_eef_xyz))
         reached = goal_dist <= self.success_threshold
         self.is_success_flag = reached and (not self.collision_flag)
@@ -1458,6 +1552,7 @@ class Lite6MotionPlanningEnv(gym.Env):
         return self.render_camera(0)
 
     def close(self):
+        self._clear_goal_marker()
         p.disconnect(self.physics_client)
 
     def is_success(self):

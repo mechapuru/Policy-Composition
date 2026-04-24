@@ -17,6 +17,7 @@ n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
+eval_checkpoint_dir: null
 
 policy:
   _target_: diffusion_policy_3d.policy.simple_dp3.SimpleDP3
