@@ -832,3 +832,65 @@ class Lite6MotionPlanningRunner(BaseRunner):
             )
 
         return log_data
+
+
+class Lite6PickPlaceRunner(UR5PyBulletRunner):
+    def __init__(
+        self,
+        output_dir,
+        n_train=10,
+        n_test=1,
+        max_steps=350,
+        n_obs_steps=2,
+        n_action_steps=8,
+        fps=10,
+        use_gui=False,
+        num_points=2500,
+        image_size=224,
+        action_dim=7,
+        max_steps_per_waypoint=4,
+        waypoint_threshold=0.02,
+        capture_table=False,
+        use_workspace_crop=True,
+        workspace_std=30.0,
+    ):
+        # We call UR5PyBulletRunner's init but then override the env_test
+        super().__init__(
+            output_dir=output_dir,
+            n_train=n_train,
+            n_test=n_test,
+            max_steps=max_steps,
+            n_obs_steps=n_obs_steps,
+            n_action_steps=n_action_steps,
+            fps=fps,
+            use_gui=use_gui,
+            num_points=num_points,
+            image_size=image_size,
+            action_dim=action_dim,
+            use_workspace_crop=use_workspace_crop,
+            workspace_std=workspace_std,
+            capture_table=capture_table,
+        )
+
+        from diffusion_policy_3d.env.pybullet.pybullet_wrapper import Lite6PickPlaceEnv
+
+        def env_fn():
+             return MultiStepWrapper(
+                SimpleVideoRecordingWrapper(
+                    Lite6PickPlaceEnv(
+                        use_gui=use_gui,
+                        num_points=num_points,
+                        image_size=image_size,
+                        action_dim=action_dim,
+                        max_steps=max_steps,
+                        max_steps_per_waypoint=max_steps_per_waypoint,
+                        waypoint_threshold=waypoint_threshold,
+                    )
+                ),
+                n_obs_steps=n_obs_steps,
+                n_action_steps=n_action_steps,
+                max_episode_steps=max_steps,
+                reward_agg_method="sum",
+            )
+        
+        self.env_test = env_fn()

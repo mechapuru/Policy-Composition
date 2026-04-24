@@ -1564,3 +1564,207 @@ class Lite6MotionPlanningEnv(gym.Env):
         self._seed = seed
         random.seed(seed)
         np.random.seed(seed)
+
+
+class Lite6PickPlaceEnv(gym.Env):
+    metadata = {"render.modes": ["rgb_array"], "video.frames_per_second": 10}
+
+    def __init__(
+        self,
+        use_gui=False,
+        num_points=2500,
+        image_size=224,
+        action_dim=7,
+        max_steps=350,
+        obs_config=None,
+        max_steps_per_waypoint=4,
+        waypoint_threshold=0.02,
+    ):
+        self.use_gui = use_gui
+        self.num_points = num_points
+        self.image_size = image_size
+        self.action_dim = action_dim
+        self.max_steps = max_steps
+        self.current_step = 0
+        self.obs_config = obs_config or {}
+        self.max_steps_per_waypoint = max_steps_per_waypoint
+        self.waypoint_threshold = waypoint_threshold
+
+        self.physics_client = p.connect(p.GUI if use_gui else p.DIRECT)
+        p.setGravity(0, 0, -9.8)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setTimeStep(1/240)
+
+        self.plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
+        self.table_id = p.loadURDF("table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0]))
+
+        self.robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
+        self.robot.load()
+        
+        self.cube_id = None
+        self.tray_id = None
+        self.is_success_flag = False
+        self.last_cam_frames = {}
+
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
+        self.observation_space = spaces.Dict(
+            {
+                "point_cloud": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_points, 3), dtype=np.float32),
+                "agent_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32),
+                "image": spaces.Box(low=0, high=255, shape=(3, self.image_size, self.image_size), dtype=np.uint8),
+            }
+        )
+
+    def _capture_camera(self):
+        # Using the same fixed camera as data generation
+        eye = np.array([0.7463, 0.3093, 1.1774])
+        direction = np.array([-0.7751, -0.4045, -0.4855])
+        direction = direction / np.linalg.norm(direction)
+        cam_eye = (eye - 0.2 * direction).tolist()
+        cam_target = (cam_eye + 1.0 * direction).tolist()
+        cam_up = [0, 0, 1]
+
+        view_matrix = p.computeViewMatrix(
+            cameraEyePosition=cam_eye,
+            cameraTargetPosition=cam_target,
+            cameraUpVector=cam_up,
+        )
+        proj_matrix = p.computeProjectionMatrixFOV(fov=60, aspect=1.0, nearVal=0.01, farVal=3.0)
+        _, _, rgb_img, depth_img, seg_img = p.getCameraImage(
+            self.image_size,
+            self.image_size,
+            viewMatrix=view_matrix,
+            projectionMatrix=proj_matrix,
+            flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
+        )
+        rgb = np.asarray(rgb_img)[:, :, :3]
+        depth = np.asarray(depth_img)
+        seg = np.asarray(seg_img)
+        return rgb, depth, seg, view_matrix, proj_matrix
+
+    def _build_point_cloud(self):
+        rgb, depth, seg, view_matrix, proj_matrix = self._capture_camera()
+        self.last_cam_frames["main"] = rgb
+
+        points = _depth_to_point_cloud_base_frame(
+            depth, view_matrix, proj_matrix, self.robot.base_pos,
+            width=self.image_size, height=self.image_size,
+        )
+        points_flat = points.reshape(-1, 3)
+        seg_flat = seg.flatten()
+        depth_flat = depth.flatten()
+
+        valid = (depth_flat < 0.9999) & (points_flat[:, 2] < 2.5)
+        exclude_ids = {self.table_id, self.plane_id}
+        for obj_id in exclude_ids:
+            valid &= (seg_flat != obj_id)
+        
+        filtered = points_flat[valid]
+        if filtered.size == 0:
+            return np.zeros((self.num_points, 3), dtype=np.float32)
+        
+        return _normalize_point_count(filtered, self.num_points)
+
+    def reset(self, cube_start_pos=None, cube_start_orn=None):
+        self.current_step = 0
+        self.is_success_flag = False
+
+        if self.cube_id is not None:
+             p.removeBody(self.cube_id)
+        if self.tray_id is not None:
+             p.removeBody(self.tray_id)
+
+        self.robot.reset_posture()
+
+        # Load tray (cylinder from data script)
+        # Position from data script: [0.1, 0.05, 0.70]
+        tray_pos = [0.1, 0.05, 0.62] 
+        self.tray_id = p.loadURDF("tray/tray.urdf", tray_pos, p.getQuaternionFromEuler([0, 0, 0]), globalScaling=0.5)
+
+        # Load cube
+        if cube_start_pos is None:
+            # Fixed start position from data collection script
+            cube_start_pos = [0.3, -0.2, 0.65]
+        if cube_start_orn is None:
+            cube_start_orn = [0, 0, 0, 1]
+            
+        self.cube_id = p.loadURDF("cube/cube.urdf", cube_start_pos, cube_start_orn, globalScaling=1.0)
+        p.changeDynamics(self.cube_id, -1, mass=0.1, lateralFriction=1.0)
+
+        for _ in range(50):
+            p.stepSimulation()
+
+        return self._get_obs()
+
+    def _get_obs(self):
+        pc = self._build_point_cloud()
+        state = self.robot.get_robot_state()
+        cam0 = self.last_cam_frames.get("main", np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8))
+        return {
+            "point_cloud": pc.astype(np.float32),
+            "agent_pos": state.astype(np.float32),
+            "image": cam0.transpose(2, 0, 1).astype(np.uint8),
+        }
+
+    def step(self, action):
+        self.current_step += 1
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        
+        target_arm = action[:6]
+        gripper_cmd_dataset = float(action[6])
+        
+        # Similar to MP step but simplified for PP
+        for _ in range(self.max_steps_per_waypoint):
+            for i, joint_id in enumerate(self.robot.arm_controllable_joints):
+                p.setJointMotorControl2(
+                    self.robot.id,
+                    joint_id,
+                    p.POSITION_CONTROL,
+                    targetPosition=float(target_arm[i]),
+                    force=150.0,
+                    maxVelocity=self.robot.max_velocity,
+                )
+            
+            # Gripper control
+            current_gripper = self.robot.get_robot_state()[-1]
+            target_gripper = current_gripper + gripper_cmd_dataset
+            self.robot.move_gripper(self.robot._dataset_gripper_to_joint(target_gripper))
+
+            p.stepSimulation()
+
+        # Success check: cube in tray
+        reward = 0.0
+        done = False
+        cube_pos, _ = p.getBasePositionAndOrientation(self.cube_id)
+        tray_pos, _ = p.getBasePositionAndOrientation(self.tray_id)
+        dist = np.linalg.norm(np.array(cube_pos[:2]) - np.array(tray_pos[:2]))
+        if dist < 0.1 and abs(cube_pos[2] - tray_pos[2]) < 0.1:
+            reward = 1.0
+            self.is_success_flag = True
+            done = True
+
+        if self.current_step >= self.max_steps:
+            done = True
+
+        return self._get_obs(), reward, done, {"is_success": self.is_success_flag}
+
+    def is_success(self):
+        return self.is_success_flag
+
+    def get_video(self):
+        return self.render_camera()
+    
+    def render_camera(self):
+        rgb, _, _, _, _ = self._capture_camera()
+        return rgb.astype(np.uint8)
+
+    def render(self, mode="rgb_array"):
+        return self.render_camera()
+    
+    def close(self):
+        p.disconnect(self.physics_client)
+
+    def seed(self, seed=None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)

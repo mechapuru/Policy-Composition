@@ -5,7 +5,7 @@ task_name: motion_plan
 shape_meta: &shape_meta
   obs:
     point_cloud:
-      shape: [5000, 3]
+      shape: [2500, 3]
       type: point_cloud
     agent_pos:
       shape: [7]
@@ -28,15 +28,15 @@ env_runner:
   image_size: 224
   action_dim: ${eval:'${shape_meta.action.shape}[0]'}
   collision_terminate: false
-  success_threshold: 0.08
-  max_steps_per_waypoint: 2
+  success_threshold: 0.01
+  max_steps_per_waypoint: 4
   waypoint_threshold: 0.01
   collision_distance_threshold : 0.01
 
 
 dataset:
   _target_: diffusion_policy_3d.dataset.motion_plan_dataset.MotionPlanDataset
-  zarr_path: /scratch2/cross-emb/robot-sim/rrc_sim_dataset_mp.zarr
+  zarr_path: /scratch3/cross-emb/dataset_mp_poco_2.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

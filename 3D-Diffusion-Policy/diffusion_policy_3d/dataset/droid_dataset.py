@@ -25,7 +25,7 @@ class DroidDataset(BaseDataset):
         super().__init__()
         self.task_name = task_name
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['state', 'action', 'point_cloud', 'img', 'cube_pos'])
+            zarr_path, keys=['state', 'action', 'point_cloud', 'img'])
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
@@ -76,7 +76,13 @@ class DroidDataset(BaseDataset):
     def _sample_to_data(self, sample):
         agent_pos = sample['state'][:,].astype(np.float32) # (T, 13)
         point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 2500, 6)
-        cube_pos = sample['cube_pos'][:,].astype(np.float32) # (T, 7) - [x,y,z,qx,qy,qz,qw]
+        
+        if 'cube_pos' in sample:
+            cube_pos = sample['cube_pos'][:,].astype(np.float32) # (T, 7)
+        else:
+            # Fixed start position OR current pose (joints + gripper) as requested
+            # Defaulting to current agent_pos (first 7 dims)
+            cube_pos = agent_pos[:, :7].copy()
 
         data = {
             'obs': {
@@ -102,7 +108,11 @@ class DroidDataset(BaseDataset):
             episode_start_idx = self.replay_buffer.episode_ends[episode_idx - 1]
         
         # Get the first cube position in the episode (initial position)
-        cube_pos = self.replay_buffer['cube_pos'][episode_start_idx].astype(np.float32)
+        if 'cube_pos' in self.replay_buffer:
+            cube_pos = self.replay_buffer['cube_pos'][episode_start_idx].astype(np.float32)
+        else:
+            # Default to agent position (joints + gripper)
+            cube_pos = self.replay_buffer['state'][episode_start_idx][:7].astype(np.float32)
         return cube_pos  # Returns [x, y, z, qx, qy, qz, qw]
     
     def get_episode(self, episode_idx: int):
@@ -128,11 +138,16 @@ class DroidDataset(BaseDataset):
         
         # Step 2: Extract the slice of actions for this episode
         episode_data = {
-            'action': self.replay_buffer['action'][start_idx:end_idx].astype(np.float32), # This gives us array of shape (350, 7) - all actions in this episode
+            'action': self.replay_buffer['action'][start_idx:end_idx].astype(np.float32), 
             'state': self.replay_buffer['state'][start_idx:end_idx].astype(np.float32),
             'point_cloud': self.replay_buffer['point_cloud'][start_idx:end_idx].astype(np.float32),
-            'cube_pos': self.replay_buffer['cube_pos'][start_idx:end_idx].astype(np.float32),
         }
+        
+        if 'cube_pos' in self.replay_buffer:
+            episode_data['cube_pos'] = self.replay_buffer['cube_pos'][start_idx:end_idx].astype(np.float32)
+        else:
+             # Default to agent position
+             episode_data['cube_pos'] = self.replay_buffer['state'][start_idx:end_idx, :7].astype(np.float32)
 
         
 
