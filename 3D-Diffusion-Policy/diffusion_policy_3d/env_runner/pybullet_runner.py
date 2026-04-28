@@ -21,6 +21,7 @@ import numpy as np
 
 import wandb
 import cv2
+import csv
 
 import os
 from datetime import datetime
@@ -700,6 +701,17 @@ class Lite6BaseRunner(BaseRunner):
     def __init__(self, output_dir):
         super().__init__(output_dir)
 
+    @staticmethod
+    def _last_info_value(value):
+        if value is None:
+            return None
+        arr = np.asarray(value)
+        if arr.shape == ():
+            return arr.item()
+        if arr.size == 0:
+            return None
+        return arr.reshape(-1)[-1].item()
+
     def _to_policy_obs(self, stacked_obs, policy, device):
         policy_obs = {}
         for key in policy.normalizer.params_dict.keys():
@@ -821,6 +833,8 @@ class Lite6MotionPlanningRunner(Lite6BaseRunner):
         self.n_action_steps = n_action_steps
         self.fps = fps
         self.action_dim = action_dim
+        self.max_steps_per_waypoint = max_steps_per_waypoint
+        self.sim_freq = sim_freq
         self.logger_util_test = logger_util.LargestKRecorder(K=3)
         self.log_wandb_videos = log_wandb_videos
         self.save_local_videos = save_local_videos
@@ -864,92 +878,159 @@ class Lite6MotionPlanningRunner(Lite6BaseRunner):
         cam0_first_episode = []
         cam1_first_episode = []
         base_env = self.env_test.env.env
+        diag_dir = os.path.join(self.output_dir, "rollout_diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        diag_path = os.path.join(diag_dir, f"motion_rollout_steps_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        diag_fields = [
+            "episode_id", "dataset_episode_idx", "policy_chunk_idx", "chunk_action_idx",
+            "rollout_action_idx", "env_step", "video_time_sec", "nominal_sim_time_sec",
+            "collision", "collision_ever", "done", "success", "goal_dist",
+            "obstacle_top_z",
+        ]
+        diag_fields += [f"action_{i}" for i in range(self.action_dim)]
+        diag_fields += [f"state_{i}" for i in range(self.action_dim)]
+        diag_fields += [f"gt_action_{i}" for i in range(self.action_dim)]
         val_episode_indices = None
         if dataset is not None and hasattr(dataset, "train_mask"):
             val_episode_indices = np.where(~dataset.train_mask)[0]
 
-        for episode_id in range(self.episode_test):
-            reset_kwargs = {}
-            if dataset is not None and hasattr(dataset, "get_episode_eval_setup"):
-                try:
-                    if val_episode_indices is not None and episode_id < len(val_episode_indices):
-                        dataset_episode_idx = int(val_episode_indices[episode_id])
-                    else:
-                        dataset_episode_idx = episode_id
-                    if dataset_episode_idx < dataset.replay_buffer.n_episodes:
-                        setup = dataset.get_episode_eval_setup(dataset_episode_idx)
-                        reset_kwargs = {
-                            "start_joint": setup["start_joint"],
-                            "start_eef_xyz": setup["start_eef_xyz"],
-                            "goal_eef_xyz": setup["goal_eef_xyz"],
-                            "start_gripper": setup["start_gripper"],
-                        }
-                except Exception as exc:
-                    cprint(f"Motion-plan eval falling back to random reset: {exc}", "yellow")
-                    reset_kwargs = {}
+        with open(diag_path, "w", newline="") as diag_file:
+            diag_writer = csv.DictWriter(diag_file, fieldnames=diag_fields)
+            diag_writer.writeheader()
 
-            obs = self.env_test.reset(**reset_kwargs)
-            policy.reset()
+            for episode_id in range(self.episode_test):
+                reset_kwargs = {}
+                dataset_episode_idx = None
+                gt_episode_actions = None
+                if dataset is not None and hasattr(dataset, "get_episode_eval_setup"):
+                    try:
+                        if val_episode_indices is not None and episode_id < len(val_episode_indices):
+                            dataset_episode_idx = int(val_episode_indices[episode_id])
+                        else:
+                            dataset_episode_idx = episode_id
+                        if dataset_episode_idx < dataset.replay_buffer.n_episodes:
+                            setup = dataset.get_episode_eval_setup(dataset_episode_idx)
+                            reset_kwargs = {
+                                "start_joint": setup["start_joint"],
+                                "start_eef_xyz": setup["start_eef_xyz"],
+                                "goal_eef_xyz": setup["goal_eef_xyz"],
+                                "start_gripper": setup["start_gripper"],
+                            }
+                            ep_start = 0 if dataset_episode_idx == 0 else int(dataset.episode_ends[dataset_episode_idx - 1])
+                            ep_end = int(dataset.episode_ends[dataset_episode_idx])
+                            gt_episode_actions = dataset.replay_buffer["action"][ep_start:ep_end, :self.action_dim]
+                    except Exception as exc:
+                        cprint(f"Motion-plan eval falling back to random reset: {exc}", "yellow")
+                        reset_kwargs = {}
+                        dataset_episode_idx = None
+                        gt_episode_actions = None
 
-            reward_sum = 0.0
-            done = False
-            final_goal_dist = None
+                obs = self.env_test.reset(**reset_kwargs)
+                policy.reset()
 
-            collect_frames = self.save_local_videos or (self.log_wandb_videos and episode_id == 0)
-            episode_cam0_frames = []
-            episode_cam1_frames = []
-            if collect_frames:
-                episode_cam0_frames.append(base_env.render_camera(0))
-                episode_cam1_frames.append(base_env.render_camera(1))
+                reward_sum = 0.0
+                done = False
+                final_goal_dist = None
+                policy_chunk_idx = 0
+                rollout_action_idx = 0
 
-            while not done:
-                policy_obs = self._to_policy_obs(obs, policy, device)
-
-                with torch.no_grad():
-                    action_dict = policy.predict_action(policy_obs)
-                action = dict_apply(action_dict, lambda x: x.detach().cpu().numpy())["action"]
-
-                if action.ndim == 3:
-                    action = action.squeeze(0)
-                elif action.ndim == 1:
-                    action = action[None, :]
-
-                action_seq = action[: self.n_action_steps]
-                obs, reward, done, info = self.env_test.step(action_seq)
-                reward_sum += float(reward)
-                final_goal_dist = float(info.get("goal_dist", final_goal_dist))
-
+                collect_frames = self.save_local_videos or (self.log_wandb_videos and episode_id == 0)
+                episode_cam0_frames = []
+                episode_cam1_frames = []
                 if collect_frames:
                     episode_cam0_frames.append(base_env.render_camera(0))
                     episode_cam1_frames.append(base_env.render_camera(1))
 
-            all_returns_test.append(reward_sum)
-            all_success_rates_test.append(1.0 if base_env.is_success() else 0.0)
-            all_collision_rates_test.append(1.0 if base_env.collision_flag else 0.0)
-            final_goal_dists.append(final_goal_dist)
-            obstacle_top_z = getattr(base_env, "last_obstacle_info", {}).get("top_z", None)
-            if obstacle_top_z is not None:
-                obstacle_top_zs.append(float(obstacle_top_z))
+                while not done:
+                    policy_obs = self._to_policy_obs(obs, policy, device)
 
-            if self.log_wandb_videos and episode_id == 0 and len(episode_cam0_frames) > 0:
-                cam0_first_episode = self._annotate_frames_with_final_error(episode_cam0_frames, final_goal_dist)
-                cam1_first_episode = self._annotate_frames_with_final_error(episode_cam1_frames, final_goal_dist)
+                    with torch.no_grad():
+                        action_dict = policy.predict_action(policy_obs)
+                    action = dict_apply(action_dict, lambda x: x.detach().cpu().numpy())["action"]
 
-            if self.save_local_videos and len(episode_cam0_frames) > 0:
-                if self.save_all_local_episodes or (episode_id == 0):
-                    saved_paths = self._save_local_episode_videos(
-                        episode_id=episode_id,
-                        cam0_frames=episode_cam0_frames,
-                        cam1_frames=episode_cam1_frames,
-                        collided=base_env.collision_flag,
-                        final_goal_dist=final_goal_dist,
-                    )
-                    saved_local_videos.extend(saved_paths)
+                    if action.ndim == 3:
+                        action = action.squeeze(0)
+                    elif action.ndim == 1:
+                        action = action[None, :]
 
-            cprint(
-                f"Lite6 Test Episode {episode_id}: Reward={reward_sum:.2f}, Success={base_env.is_success()}, Collision={base_env.collision_flag}, GoalDist={final_goal_dist}, ObstacleTopZ={obstacle_top_z}",
-                "yellow",
-            )
+                    action_seq = action[: self.n_action_steps]
+                    for chunk_action_idx, act in enumerate(action_seq):
+                        if done:
+                            break
+                        obs, reward, done, info = self.env_test.step(act[None, :])
+                        reward_sum += float(reward)
+
+                        info_goal_dist = self._last_info_value(info.get("goal_dist", final_goal_dist))
+                        if info_goal_dist is not None:
+                            final_goal_dist = float(info_goal_dist)
+
+                        obstacle_top_z = getattr(base_env, "last_obstacle_info", {}).get("top_z", None)
+                        state = np.asarray(obs["agent_pos"][-1], dtype=np.float32)
+                        row = {
+                            "episode_id": episode_id,
+                            "dataset_episode_idx": "" if dataset_episode_idx is None else dataset_episode_idx,
+                            "policy_chunk_idx": policy_chunk_idx,
+                            "chunk_action_idx": chunk_action_idx,
+                            "rollout_action_idx": rollout_action_idx,
+                            "env_step": int(base_env.current_step),
+                            "video_time_sec": float(base_env.current_step) / float(max(1, self.fps)),
+                            "nominal_sim_time_sec": (
+                                float(base_env.current_step * self.max_steps_per_waypoint)
+                                / float(max(1, self.sim_freq))
+                            ),
+                            "collision": bool(self._last_info_value(info.get("collision", False))),
+                            "collision_ever": bool(base_env.collision_flag),
+                            "done": bool(done),
+                            "success": bool(base_env.is_success()),
+                            "goal_dist": "" if final_goal_dist is None else final_goal_dist,
+                            "obstacle_top_z": "" if obstacle_top_z is None else float(obstacle_top_z),
+                        }
+                        for i in range(self.action_dim):
+                            row[f"action_{i}"] = float(act[i])
+                            row[f"state_{i}"] = float(state[i])
+                            if gt_episode_actions is not None and rollout_action_idx < len(gt_episode_actions):
+                                row[f"gt_action_{i}"] = float(gt_episode_actions[rollout_action_idx, i])
+                            else:
+                                row[f"gt_action_{i}"] = ""
+                        diag_writer.writerow(row)
+                        diag_file.flush()
+
+                        rollout_action_idx += 1
+                        if collect_frames:
+                            episode_cam0_frames.append(base_env.render_camera(0))
+                            episode_cam1_frames.append(base_env.render_camera(1))
+
+                    policy_chunk_idx += 1
+
+                all_returns_test.append(reward_sum)
+                all_success_rates_test.append(1.0 if base_env.is_success() else 0.0)
+                all_collision_rates_test.append(1.0 if base_env.collision_flag else 0.0)
+                final_goal_dists.append(final_goal_dist)
+                obstacle_top_z = getattr(base_env, "last_obstacle_info", {}).get("top_z", None)
+                if obstacle_top_z is not None:
+                    obstacle_top_zs.append(float(obstacle_top_z))
+
+                if self.log_wandb_videos and episode_id == 0 and len(episode_cam0_frames) > 0:
+                    cam0_first_episode = self._annotate_frames_with_final_error(episode_cam0_frames, final_goal_dist)
+                    cam1_first_episode = self._annotate_frames_with_final_error(episode_cam1_frames, final_goal_dist)
+
+                if self.save_local_videos and len(episode_cam0_frames) > 0:
+                    if self.save_all_local_episodes or (episode_id == 0):
+                        saved_paths = self._save_local_episode_videos(
+                            episode_id=episode_id,
+                            cam0_frames=episode_cam0_frames,
+                            cam1_frames=episode_cam1_frames,
+                            collided=base_env.collision_flag,
+                            final_goal_dist=final_goal_dist,
+                        )
+                        saved_local_videos.extend(saved_paths)
+
+                cprint(
+                    f"Lite6 Test Episode {episode_id}: Reward={reward_sum:.2f}, Success={base_env.is_success()}, Collision={base_env.collision_flag}, GoalDist={final_goal_dist}, ObstacleTopZ={obstacle_top_z}",
+                    "yellow",
+                )
+
+        cprint(f"Saved motion rollout diagnostics to: {diag_path}", "cyan")
 
         sr_mean = float(np.mean(all_success_rates_test)) if len(all_success_rates_test) > 0 else 0.0
         returns_mean = float(np.mean(all_returns_test)) if len(all_returns_test) > 0 else 0.0
