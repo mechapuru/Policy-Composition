@@ -107,12 +107,19 @@ class MotionPlanDataset(BaseDataset):
         return torch_data
 
     def get_episode_eval_setup(self, episode_idx: int) -> Dict[str, np.ndarray]:
-        """Return stored start/goal setup for exact evaluation reset."""
+        """Return dataset-aligned reset/goal setup for evaluation.
+
+        The raw start_configuration is the IK start before rollout capture.
+        Policy observations start at the first recorded frame, so reset joints
+        and gripper from data/state at the episode start.
+        """
+        episode_start_idx = 0 if episode_idx == 0 else int(self.episode_ends[episode_idx - 1])
+        first_state = self.replay_buffer['state'][episode_start_idx, :7].astype(np.float32)
         start_cfg = self.start_configuration[episode_idx].astype(np.float32)
         end_cfg = self.end_configuration[episode_idx].astype(np.float32)
         return {
-            'start_joint': start_cfg[:6],
+            'start_joint': first_state[:6],
             'start_eef_xyz': start_cfg[6:9],
-            'start_gripper': start_cfg[13],
+            'start_gripper': first_state[6],
             'goal_eef_xyz': end_cfg[6:9],
         }

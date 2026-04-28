@@ -28,12 +28,12 @@ env_runner:
   image_size: 224
   action_dim: ${eval:'${shape_meta.action.shape}[0]'}
   collision_terminate: false
-  success_threshold: 0.01
-  max_steps_per_waypoint: 4
+  success_threshold: 0.04
+  max_steps_per_waypoint: 1
   waypoint_threshold: 0.01
   collision_distance_threshold : 0.01
   sim_freq: 60
-  obstacle_max_top_z: null
+  obstacle_max_top_z: 1.115
 
 
 dataset:
