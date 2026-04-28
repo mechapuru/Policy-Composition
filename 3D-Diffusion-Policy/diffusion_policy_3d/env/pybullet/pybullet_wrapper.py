@@ -12,6 +12,11 @@ import time
 import os
 from collections import namedtuple
 
+try:
+    import fpsample
+except ImportError:
+    fpsample = None
+
 
 
 def compute_workspace_bounds(pc_xyz, n_std=30):
@@ -831,6 +836,16 @@ _LITE6_MP_CAMERAS = [
     },
 ]
 
+_LITE6_SINGLE_CAMERA_DIRECTION = np.array([-0.7751, -0.4045, -0.4855], dtype=np.float32)
+_LITE6_SINGLE_CAMERA_DIRECTION = _LITE6_SINGLE_CAMERA_DIRECTION / np.linalg.norm(_LITE6_SINGLE_CAMERA_DIRECTION)
+_LITE6_SINGLE_CAMERA_EYE = np.array([0.7463, 0.3093, 1.1774], dtype=np.float32) - 0.2 * _LITE6_SINGLE_CAMERA_DIRECTION
+_LITE6_SINGLE_CAMERA = {
+    "name": "third_person",
+    "eye": _LITE6_SINGLE_CAMERA_EYE.tolist(),
+    "target": (_LITE6_SINGLE_CAMERA_EYE + _LITE6_SINGLE_CAMERA_DIRECTION).tolist(),
+    "up": [0, 0, 1],
+}
+
 
 def _depth_to_point_cloud_base_frame(
     depth_buffer,
@@ -874,6 +889,64 @@ def _normalize_point_count(points: np.ndarray, num_points: int):
     return points.astype(np.float32, copy=False)
 
 
+def _sample_or_pad_points(points: np.ndarray, num_points: int):
+    """Match reprocess_datasets.py sampling: FPS when dense, repeat-pad when sparse."""
+    points = np.asarray(points, dtype=np.float32)
+    if points.shape[0] == 0:
+        return np.zeros((num_points, 3), dtype=np.float32)
+    if points.shape[0] >= num_points:
+        if fpsample is not None:
+            indices = fpsample.fps_npdu_sampling(points, num_points)
+        else:
+            indices = np.random.choice(points.shape[0], size=num_points, replace=False)
+        return points[indices].astype(np.float32, copy=False)
+
+    pad_indices = np.random.choice(points.shape[0], size=(num_points - points.shape[0]), replace=True)
+    return np.vstack([points, points[pad_indices]]).astype(np.float32, copy=False)
+
+
+def _build_class_balanced_point_cloud(
+    depth,
+    seg,
+    view_matrix,
+    proj_matrix,
+    base_pos,
+    robot_id,
+    object_ids,
+    width=224,
+    height=224,
+    robot_points=2000,
+    object_points=500,
+):
+    points = _depth_to_point_cloud_base_frame(
+        depth,
+        view_matrix,
+        proj_matrix,
+        base_pos,
+        width=width,
+        height=height,
+    )
+    points_flat = points.reshape(-1, 3)
+    body_ids = np.asarray(seg).flatten() & 0xFFFFFF
+    depth_flat = np.asarray(depth).flatten()
+
+    valid = (depth_flat < 0.9999) & (points_flat[:, 2] < 2.5)
+    robot_mask = body_ids == int(robot_id)
+    object_ids = {int(obj_id) for obj_id in object_ids if obj_id is not None}
+    if object_ids:
+        object_mask = np.isin(body_ids, list(object_ids))
+    else:
+        object_mask = np.zeros_like(robot_mask, dtype=bool)
+
+    robot_pts = points_flat[robot_mask & valid]
+    object_pts = points_flat[object_mask & valid]
+    sampled_robot = _sample_or_pad_points(robot_pts, robot_points)
+    sampled_object = _sample_or_pad_points(object_pts, object_points)
+    point_cloud = np.concatenate([sampled_robot, sampled_object], axis=0)
+    shuffle_idx = np.random.permutation(point_cloud.shape[0])
+    return point_cloud[shuffle_idx].astype(np.float32, copy=False)
+
+
 def create_static_box(position, half_extents, yaw=0.0, color=[0.8, 0.3, 0.3, 1]):
     orientation_quat = p.getQuaternionFromEuler([0, 0, yaw])
     collision_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
@@ -897,46 +970,41 @@ def create_static_sphere(position, radius, color=[0.2, 0.9, 0.2, 1.0]):
     )
 
 
-def generate_task_obstacles(start_pos, goal_pos, obs_config):
+def generate_task_obstacles(start_pos, goal_pos, obs_config=None):
+    """Generate a tall tower at the middle of start and end sitting on the table, matching data script."""
+    obs_config = obs_config or {}
     obstacles = []
-    p_start = np.array(start_pos, dtype=np.float32)
-    p_goal = np.array(goal_pos, dtype=np.float32)
+    p_start = np.array(start_pos)
+    p_goal = np.array(goal_pos)
+    height_start = p_start[2] - 0.625 # Table height
+    height_goal = p_goal[2] - 0.625
     midpoint = p_start + 0.5 * (p_goal - p_start)
+    min_half_z = max(height_start, height_goal) / 2
+    max_half_z = 0.4
 
-    obs1_size_cfg = obs_config.get("obs1_size", [0.02, 0.15, 0.1])
-    max_y = obs1_size_cfg[1]
-    max_z = obs1_size_cfg[2]
-    size_1 = [
-        random.uniform(0.01, 0.03),
-        random.uniform(0.05, max_y - 0.1),
-        random.uniform(0.05, max_z),
+    max_top_z = obs_config.get("max_top_z", None)
+    if max_top_z is not None:
+        max_half_z = min(max_half_z, (float(max_top_z) - 0.625) / 2)
+        max_half_z = max(min_half_z, max_half_z)
+    
+    # Sitting on the table (0.625)
+    box_half_extents = [
+        random.uniform(0.02, 0.03), 
+        random.uniform(0.02, 0.03), 
+        random.uniform(min_half_z, max_half_z)
     ]
-    yaw_1 = random.uniform(-1.57 / 2, 1.57 / 2)
-    obstacles.append(
-        create_static_box(position=midpoint.tolist(), half_extents=size_1, yaw=yaw_1, color=[0.8, 0.2, 0.2, 1.0])
-    )
-
-    trap_strategy = random.choice(["horizontal_wall", "plate", "ignore"])
-    if trap_strategy == "ignore":
-        return obstacles
-
-    if trap_strategy == "horizontal_wall":
-        trap_pos = midpoint + np.array([random.choice([-0.1, 0.1]), 0.0, -0.05], dtype=np.float32)
-        yaw_2 = 0.0
-        size_2 = [0.02, 0.25, 0.04]
-        color_2 = [0.8, 0.8, 0.2, 1.0]
-    else:
-        y_shift = random.uniform(-0.05, 0.05)
-        trap_pos = midpoint + np.array([0.05, y_shift, 0.0], dtype=np.float32)
-        trap_pos[2] = max(float(start_pos[2]), float(goal_pos[2])) + 0.15
-        yaw_2 = 0.0
-        size_2 = [0.1, 0.05, 0.1]
-        color_2 = [0.2, 0.8, 0.8, 1.0]
-
-    obstacles.append(
-        create_static_box(position=trap_pos.tolist(), half_extents=size_2, yaw=yaw_2, color=color_2)
-    )
-    return obstacles
+    box_position = [midpoint[0], midpoint[1], 0.625 + box_half_extents[2]]
+    yaw = random.uniform(-1.57 / 15, 1.57 / 15) # Match data-generation yaw range.
+    box_id = create_static_box(position=box_position, half_extents=box_half_extents, yaw=yaw, color=[0.8, 0.2, 0.2, 1.0])
+    obstacles.append(box_id)
+    obstacle_info = {
+        "half_extents": [float(v) for v in box_half_extents],
+        "position": [float(v) for v in box_position],
+        "yaw": float(yaw),
+        "height": float(2.0 * box_half_extents[2]),
+        "top_z": float(box_position[2] + box_half_extents[2]),
+    }
+    return obstacles, obstacle_info
 
 class Lite6Robot:
     def __init__(self, pos, ori):
@@ -1155,14 +1223,11 @@ class Lite6Robot:
             if abs(current_pos - prismatic_target) < 2e-3:
                 break
 
-    def reset_posture(self):
+    def reset_posture(self, initial_orn_euler=[3.14, 0, 0]):
         """Robustly reset the robot to the initial pose and gripper open."""
         # Initial reset posture
         initial_pos_world = [0.125, 0.01, 0.62 + 0.377]
-        # Old orientation not considering the tcp axes
-        # initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
-        # Now considering the TCP orientation as well, which is rotated 90 degrees around Y from the base link
-        initial_orn_world = p.getQuaternionFromEuler([-1.5708,0, 1.5708])
+        initial_orn_world = p.getQuaternionFromEuler(initial_orn_euler)
 
         # Reset joints to rest_poses FIRST
         for i, joint_id in enumerate(self.arm_controllable_joints):
@@ -1205,6 +1270,13 @@ class Lite6Robot:
         eef_state = p.getLinkState(self.id, self.eef_id)
         return eef_state[0], eef_state[1]
 
+    def dataset_gripper_to_joint(self, gripper_cmd):
+        """Map dataset gripper command [0, 1] to Lite6 finger joint [-0.04, -0.028]."""
+        cmd = float(np.clip(gripper_cmd, 0.0, 1.0))
+        open_pos = -0.04
+        grasp_pos = -0.028
+        return open_pos + cmd * (grasp_pos - open_pos)
+
     def get_robot_state(self):
         """Get robot state: 6 arm joints + 1 gripper normalized [0, 1]"""
         joint_states = [p.getJointState(self.id, i)[0] for i in self.arm_controllable_joints]
@@ -1244,10 +1316,11 @@ class Lite6MotionPlanningEnv(gym.Env):
         max_steps=350,
         collision_terminate=False,
         collision_distance_threshold=0.01,
-        success_threshold=0.03,
+        success_threshold=0.01,
         obs_config=None,
         max_steps_per_waypoint=10,
         waypoint_threshold=0.01,
+        sim_freq=60,
     ):
         self.use_gui = use_gui
         self.num_points = num_points
@@ -1261,10 +1334,12 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.obs_config = obs_config or {}
         self.max_steps_per_waypoint = max_steps_per_waypoint
         self.waypoint_threshold = waypoint_threshold
+        self.sim_freq = sim_freq
 
         self.physics_client = p.connect(p.GUI if use_gui else p.DIRECT)
         p.setGravity(0, 0, -9.8)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setTimeStep(1.0 / float(self.sim_freq))
 
         self.plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
         self.table_id = p.loadURDF("table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0]))
@@ -1272,6 +1347,7 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
         self.robot.load()
         self.goal_marker_id = None
+        tcp_link_index = -1
         for i in range(p.getNumJoints(self.robot.id)):
             joint_info = p.getJointInfo(self.robot.id, i)
             # index 1 is the joint name, index 12 is the child link name
@@ -1292,6 +1368,7 @@ class Lite6MotionPlanningEnv(gym.Env):
         self.goal_marker_radius = 0.015
         self.goal_marker_color = [0.1, 0.9, 0.1, 1.0]
         self.obstacle_ids = []
+        self.last_obstacle_info = {}
         self.collision_flag = False
         self.is_success_flag = False
         self.last_cam_frames = {}
@@ -1326,38 +1403,21 @@ class Lite6MotionPlanningEnv(gym.Env):
         return rgb, depth, seg, view_matrix, proj_matrix
 
     def _build_point_cloud(self):
-        merged = []
-        exclude_ids = {self.table_id, self.plane_id}
-        if self.goal_marker_id is not None:
-            exclude_ids.add(self.goal_marker_id)
-        for cam_cfg in _LITE6_MP_CAMERAS:
+        for cam_cfg in [_LITE6_SINGLE_CAMERA]:
             rgb, depth, seg, view_matrix, proj_matrix = self._capture_camera(cam_cfg)
             self.last_cam_frames[cam_cfg["name"]] = rgb
-
-            points = _depth_to_point_cloud_base_frame(
+            return _build_class_balanced_point_cloud(
                 depth,
+                seg,
                 view_matrix,
                 proj_matrix,
                 self.robot.base_pos,
+                self.robot.id,
+                self.obstacle_ids,
                 width=self.image_size,
                 height=self.image_size,
             )
-            points_flat = points.reshape(-1, 3)
-            seg_flat = seg.flatten()
-            depth_flat = depth.flatten()
-
-            valid = (depth_flat < 0.9999) & (points_flat[:, 2] < 2.5)
-            for obj_id in exclude_ids:
-                valid &= (seg_flat != obj_id)
-            filtered = points_flat[valid]
-            if filtered.size > 0:
-                merged.append(filtered)
-
-        if len(merged) == 0:
-            return np.zeros((self.num_points, 3), dtype=np.float32)
-
-        points = np.concatenate(merged, axis=0).astype(np.float32, copy=False)
-        return _normalize_point_count(points, self.num_points)
+        return np.zeros((self.num_points, 3), dtype=np.float32)
 
     def _check_collision(self):
         for body_id in [self.table_id] + list(self.obstacle_ids):
@@ -1386,7 +1446,7 @@ class Lite6MotionPlanningEnv(gym.Env):
     def _get_obs(self):
         pc = self._build_point_cloud()
         state = self.robot.get_robot_state()
-        cam0 = self.last_cam_frames.get("thirdperson_cam00", np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8))
+        cam0 = self.last_cam_frames.get("third_person", np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8))
         return {
             "point_cloud": pc.astype(np.float32),
             "agent_pos": state.astype(np.float32),
@@ -1394,12 +1454,6 @@ class Lite6MotionPlanningEnv(gym.Env):
             "image": cam0.transpose(2, 0, 1).astype(np.uint8),
         }
 
-    def _dataset_gripper_to_joint(self, gripper_cmd):
-        """Map dataset gripper command [0, 1] to Lite6 finger joint [-0.04, 0.0]."""
-        cmd = float(np.clip(gripper_cmd, 0.0, 1.0))
-        open_joint = self.robot.gripper_range[0]   # -0.04 (open)
-        close_joint = self.robot.gripper_range[1]  # 0.0 (closed)
-        return open_joint + cmd * (close_joint - open_joint)
 
     def _clear_goal_marker(self):
         if self.goal_marker_id is None:
@@ -1420,8 +1474,8 @@ class Lite6MotionPlanningEnv(gym.Env):
             color=self.goal_marker_color,
         )
 
-    def reset(self, start_joint=None, goal_eef_xyz=None, cube_start_pos=None, cube_start_orn=None):
-        del start_joint, cube_start_pos, cube_start_orn
+    def reset(self, start_joint=None, start_eef_xyz=None, goal_eef_xyz=None, start_gripper=None, cube_start_pos=None, cube_start_orn=None):
+        del cube_start_pos, cube_start_orn
         self.current_step = 0
         self.collision_flag = False
         self.is_success_flag = False
@@ -1433,36 +1487,56 @@ class Lite6MotionPlanningEnv(gym.Env):
                 pass
         self.obstacle_ids = []
 
-        self.robot.reset_posture()
+        # Motion planning script orientation: rotated side view
+        self.robot.reset_posture(initial_orn_euler=[-1.5708, 0, 1.5708])
 
-        self.start_eef_xyz = np.array([0.25, -0.2, 0.75], dtype=np.float32)
+        # Match data collection mission logic
+        const_x_pos = 0.30
+        const_y_pos = 0.20
+        const_z_pos = 0.625
+        
+        if start_eef_xyz is None:
+            self.start_eef_xyz = np.array([
+                const_x_pos,
+                -const_y_pos + 0.07,
+                const_z_pos + np.random.uniform(0.2, 0.35)
+            ], dtype=np.float32)
+        else:
+            self.start_eef_xyz = np.asarray(start_eef_xyz, dtype=np.float32)
 
-        self.goal_eef_xyz = np.array([
-            0.35 + np.random.uniform(-0.05, 0.0),
-            0.20 + np.random.uniform(-0.05, 0.05),
-            0.75 + float(np.random.uniform(-0.05, 0.2, size=1)[0]),
-        ], dtype=np.float32)
+        if goal_eef_xyz is None:
+            self.goal_eef_xyz = np.array([
+                const_x_pos,
+                const_y_pos - 0.07,
+                const_z_pos + np.random.uniform(0.2, 0.35)
+            ], dtype=np.float32)
+        else:
+            self.goal_eef_xyz = np.asarray(goal_eef_xyz, dtype=np.float32)
 
         self._update_goal_marker()
 
-        self.obstacle_ids = generate_task_obstacles(
+        self.obstacle_ids, self.last_obstacle_info = generate_task_obstacles(
             self.start_eef_xyz.tolist(),
             self.goal_eef_xyz.tolist(),
             self.obs_config,
         )
 
-        start_joint_target = p.calculateInverseKinematics(
-            self.robot.id,
-            self.robot.eef_id,
-            self.start_eef_xyz.tolist(),
-            self.target_orn,
-            lowerLimits=self.robot.arm_lower_limits,
-            upperLimits=self.robot.arm_upper_limits,
-            jointRanges=self.robot.arm_joint_ranges,
-            restPoses=self.robot.arm_rest_poses,
-            maxNumIterations=100,
-            residualThreshold=1e-5,
-        )
+        if start_joint is None:
+            start_joint_target = p.calculateInverseKinematics(
+                self.robot.id,
+                self.robot.eef_id,
+                self.start_eef_xyz.tolist(),
+                self.target_orn,
+                lowerLimits=self.robot.arm_lower_limits,
+                upperLimits=self.robot.arm_upper_limits,
+                jointRanges=self.robot.arm_joint_ranges,
+                restPoses=self.robot.arm_rest_poses,
+                maxNumIterations=100,
+                residualThreshold=1e-5,
+            )
+        else:
+            start_joint_target = np.asarray(start_joint, dtype=np.float32)
+
         for i, joint_id in enumerate(self.robot.arm_controllable_joints):
             p.resetJointState(self.robot.id, joint_id, start_joint_target[i], targetVelocity=0)
             p.setJointMotorControl2(
@@ -1473,7 +1547,9 @@ class Lite6MotionPlanningEnv(gym.Env):
                 force=1000,
             )
         # Dataset convention: 0=open, 1=close.
-        self.robot.move_gripper(self._dataset_gripper_to_joint(0.0))
+        if start_gripper is None:
+            start_gripper = 0.0
+        self.robot.move_gripper(self.robot.dataset_gripper_to_joint(float(start_gripper)))
         for _ in range(120):
             p.stepSimulation()
 
@@ -1488,7 +1564,7 @@ class Lite6MotionPlanningEnv(gym.Env):
         target_arm = action[:6]
         gripper_cmd_dataset = float(action[6])
         current_gripper_pos = self.robot.get_robot_state()[-1]  # Last element is gripper state [0, 1]
-        gripper_target_joint = self._dataset_gripper_to_joint(current_gripper_pos+gripper_cmd_dataset)
+        gripper_target_joint = self.robot.dataset_gripper_to_joint(current_gripper_pos + gripper_cmd_dataset)
         self.robot.move_gripper(gripper_target_joint)
 
         collided = False
@@ -1538,12 +1614,13 @@ class Lite6MotionPlanningEnv(gym.Env):
             "collision": collided,
             "collision_ever": self.collision_flag,
             "goal_dist": goal_dist,
+            "obstacle_info": self.last_obstacle_info,
         }
         return obs, reward, done, info
 
     def render_camera(self, camera_index=0):
-        camera_index = int(np.clip(camera_index, 0, len(_LITE6_MP_CAMERAS) - 1))
-        cam_cfg = _LITE6_MP_CAMERAS[camera_index]
+        del camera_index
+        cam_cfg = _LITE6_SINGLE_CAMERA
         rgb, _, _, _, _ = self._capture_camera(cam_cfg)
         return rgb.astype(np.uint8)
 
@@ -1645,25 +1722,17 @@ class Lite6PickPlaceEnv(gym.Env):
     def _build_point_cloud(self):
         rgb, depth, seg, view_matrix, proj_matrix = self._capture_camera()
         self.last_cam_frames["main"] = rgb
-
-        points = _depth_to_point_cloud_base_frame(
-            depth, view_matrix, proj_matrix, self.robot.base_pos,
-            width=self.image_size, height=self.image_size,
+        return _build_class_balanced_point_cloud(
+            depth,
+            seg,
+            view_matrix,
+            proj_matrix,
+            self.robot.base_pos,
+            self.robot.id,
+            [self.cube_id, self.tray_id],
+            width=self.image_size,
+            height=self.image_size,
         )
-        points_flat = points.reshape(-1, 3)
-        seg_flat = seg.flatten()
-        depth_flat = depth.flatten()
-
-        valid = (depth_flat < 0.9999) & (points_flat[:, 2] < 2.5)
-        exclude_ids = {self.table_id, self.plane_id}
-        for obj_id in exclude_ids:
-            valid &= (seg_flat != obj_id)
-        
-        filtered = points_flat[valid]
-        if filtered.size == 0:
-            return np.zeros((self.num_points, 3), dtype=np.float32)
-        
-        return _normalize_point_count(filtered, self.num_points)
 
     def reset(self, cube_start_pos=None, cube_start_orn=None):
         self.current_step = 0
@@ -1676,10 +1745,26 @@ class Lite6PickPlaceEnv(gym.Env):
 
         self.robot.reset_posture()
 
-        # Load tray (cylinder from data script)
-        # Position from data script: [0.1, 0.05, 0.70]
-        tray_pos = [0.1, 0.05, 0.62] 
-        self.tray_id = p.loadURDF("tray/tray.urdf", tray_pos, p.getQuaternionFromEuler([0, 0, 0]), globalScaling=0.5)
+        # Match script: [0.30, 0.20, 0.625]
+        tray_pos = [0.30, 0.20, 0.625] 
+        cylinder_radius = 0.05
+        cylinder_height = 0.04
+        
+        # Create cylinder using primitives as in the data script
+        visual_shape = p.createVisualShape(
+            p.GEOM_CYLINDER, radius=cylinder_radius, length=cylinder_height, rgbaColor=[1, 0.5, 0, 1]
+        )
+        collision_shape = p.createCollisionShape(
+            p.GEOM_CYLINDER, radius=cylinder_radius, height=cylinder_height
+        )
+        self.tray_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=collision_shape,
+            baseVisualShapeIndex=visual_shape,
+            basePosition=[tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height/2]
+        )
+        self.cylinder_radius = cylinder_radius
+        self.cylinder_top_z = tray_pos[2] + cylinder_height
 
         # Load cube
         if cube_start_pos is None:
@@ -1688,8 +1773,10 @@ class Lite6PickPlaceEnv(gym.Env):
         if cube_start_orn is None:
             cube_start_orn = [0, 0, 0, 1]
             
-        self.cube_id = p.loadURDF("cube/cube.urdf", cube_start_pos, cube_start_orn, globalScaling=1.0)
-        p.changeDynamics(self.cube_id, -1, mass=0.1, lateralFriction=1.0)
+        # Use cube_small.urdf to match script if possible, or standard cube
+        self.cube_id = p.loadURDF("cube_small.urdf", cube_start_pos, cube_start_orn)
+        p.changeDynamics(self.cube_id, -1, mass=0.1, lateralFriction=5.0, spinningFriction=5, rollingFriction=5)
+        p.changeVisualShape(self.cube_id, -1, rgbaColor=[0, 0, 0, 1])
 
         for _ in range(50):
             p.stepSimulation()
@@ -1712,6 +1799,10 @@ class Lite6PickPlaceEnv(gym.Env):
         
         target_arm = action[:6]
         gripper_cmd_dataset = float(action[6])
+
+        current_gripper = self.robot.get_robot_state()[-1]
+        target_gripper = current_gripper + gripper_cmd_dataset
+        self.robot.move_gripper(self.robot.dataset_gripper_to_joint(target_gripper))
         
         # Similar to MP step but simplified for PP
         for _ in range(self.max_steps_per_waypoint):
@@ -1724,21 +1815,19 @@ class Lite6PickPlaceEnv(gym.Env):
                     force=150.0,
                     maxVelocity=self.robot.max_velocity,
                 )
-            
-            # Gripper control
-            current_gripper = self.robot.get_robot_state()[-1]
-            target_gripper = current_gripper + gripper_cmd_dataset
-            self.robot.move_gripper(self.robot._dataset_gripper_to_joint(target_gripper))
 
             p.stepSimulation()
 
-        # Success check: cube in tray
+        # Success check: cube on cylinder (dist < radius) and resting on its surface
         reward = 0.0
         done = False
         cube_pos, _ = p.getBasePositionAndOrientation(self.cube_id)
-        tray_pos, _ = p.getBasePositionAndOrientation(self.tray_id)
-        dist = np.linalg.norm(np.array(cube_pos[:2]) - np.array(tray_pos[:2]))
-        if dist < 0.1 and abs(cube_pos[2] - tray_pos[2]) < 0.1:
+        dist_to_center = np.linalg.norm(np.array(cube_pos[:2]) - np.array([0.30, 0.20]))
+        
+        # Match script condition exactly
+        inside_tray = dist_to_center < self.cylinder_radius and cube_pos[2] > self.cylinder_top_z + 0.01
+        
+        if inside_tray:
             reward = 1.0
             self.is_success_flag = True
             done = True

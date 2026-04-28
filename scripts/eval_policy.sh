@@ -5,6 +5,8 @@
 
 
 DEBUG=False
+wandb_mode=offline
+save_ckpt=False
 
 alg_name=${1}
 task_name=${2}
@@ -15,13 +17,14 @@ exp_name=${task_name}-${alg_name}-${addition_info}
 run_dir="data/outputs/${exp_name}_seed${seed}"
 
 gpu_id=${5}
+ckpt_path=${6}
 
 
 cd 3D-Diffusion-Policy
 
 export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${gpu_id}
-python eval.py --config-name=${config_name}.yaml \
+cmd=(python eval.py --config-name=${config_name}.yaml \
                             task=${task_name} \
                             hydra.run.dir=${run_dir} \
                             training.debug=$DEBUG \
@@ -29,7 +32,17 @@ python eval.py --config-name=${config_name}.yaml \
                             training.device="cuda:0" \
                             exp_name=${exp_name} \
                             logging.mode=${wandb_mode} \
-                            checkpoint.save_ckpt=${save_ckpt}
+                            checkpoint.save_ckpt=${save_ckpt})
+
+if [ -n "${ckpt_path}" ]; then
+    cmd+=("+eval.ckpt_path=\"${ckpt_path}\"")
+fi
+
+for override in "${@:7}"; do
+    cmd+=("${override}")
+done
+
+"${cmd[@]}"
 
 
 

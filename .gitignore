@@ -5,6 +5,9 @@
 __pycache__/
 scripts/plot/pdfs/
 videos/
+AGENTS.md
+.codex
+*.csv
 run_3seed.sh
 visualizations/
 MinkowskiEngine/

@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 # CONFIG
 DATA_ROOT = "/scratch3/cross-emb/dataset_mp_poco"
-OUT_ZARR = "/scratch3/cross-emb/dataset_mp_poco_2.zarr"
+OUT_ZARR = "/scratch3/cross-emb/dataset_mp_poco_final.zarr"
 CHUNK_SIZE = 100
 # Set to True for the 3-camera layout produced by motion_plan_data().
 # Set to False for the single-camera layout produced by the grab-cube collector.
@@ -220,9 +220,9 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
     else:
         cam = CAMERAS[0]
         rgb_dir = os.path.join(traj_dir, "third_person", "rgb")
-        pcd_dir = os.path.join(traj_dir, "third_person", "pcd")
+        pcd_dir = os.path.join(traj_dir, "third_person", "seg_pc")
         if not os.path.isdir(rgb_dir) or not os.path.isdir(pcd_dir):
-            print(f"  Skipping {traj_name}: missing third_person/rgb or third_person/pcd")
+            print(f"  Skipping {traj_name}: missing third_person/rgb or third_person/seg_pc")
             return None
 
         rgb_files = sorted_files(rgb_dir, ".png")
@@ -251,7 +251,7 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
                 pcd_path = os.path.join(traj_dir, cam, "pcd", pcd_files_by_cam[cam][i])
             else:
                 rgb_path = os.path.join(traj_dir, "third_person", "rgb", rgb_files_by_cam[cam][i])
-                pcd_path = os.path.join(traj_dir, "third_person", "pcd", pcd_files_by_cam[cam][i])
+                pcd_path = os.path.join(traj_dir, "third_person", "seg_pc", pcd_files_by_cam[cam][i])
 
             img = np.array(Image.open(rgb_path), dtype=np.uint8)
             pc = np.load(pcd_path).astype(np.float32, copy=False)

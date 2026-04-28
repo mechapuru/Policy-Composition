@@ -32,11 +32,13 @@ env_runner:
   max_steps_per_waypoint: 4
   waypoint_threshold: 0.01
   collision_distance_threshold : 0.01
+  sim_freq: 60
+  obstacle_max_top_z: null
 
 
 dataset:
   _target_: diffusion_policy_3d.dataset.motion_plan_dataset.MotionPlanDataset
-  zarr_path: /scratch3/cross-emb/dataset_mp_poco_2.zarr
+  zarr_path: /scratch3/cross-emb/dataset_mp_poco_final.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

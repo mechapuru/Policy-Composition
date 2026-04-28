@@ -16,7 +16,7 @@ addition_info=${3}
 seed=${4}
 gpu_id=${5}
 exp_name=${task_name}-${alg_name}-${addition_info}
-run_dir="/scratch2/cross-emb/DP3_outputs/${exp_name}_seed${seed}"
+run_dir="/scratch3/cross-emb/DP3_output/${exp_name}_seed${seed}"
 gpu_id=${5}
 # gpu_id=$(bash scripts/find_gpu.sh)
 

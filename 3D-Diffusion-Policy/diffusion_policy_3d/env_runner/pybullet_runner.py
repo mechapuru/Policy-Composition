@@ -118,6 +118,116 @@ class UR5PyBulletRunner(BaseRunner):
             )
 
         self.env_test = env_fn()
+
+    def run(self, policy: BasePolicy, dataset=None):
+        device = policy.device
+        all_returns_test = []
+        all_success_rates_test = []
+        all_collision_rates_test = []
+        saved_local_videos = []
+        final_goal_dists = []
+
+        cam0_first_episode = []
+        cam1_first_episode = []
+
+        for episode_id in range(self.episode_test):
+            # Try to get cube position from dataset if available
+            cube_start_pos = None
+            cube_start_orn = None
+            if dataset is not None and hasattr(dataset, 'get_episode_cube_start_pos') and episode_id < dataset.replay_buffer.n_episodes:
+                try:
+                    cube_info = dataset.get_episode_cube_start_pos(episode_id)
+                    if cube_info is not None:
+                        cube_start_pos = cube_info[:3]
+                        cube_start_orn = cube_info[3:7]
+                except:
+                    pass
+
+            if cube_start_pos is not None:
+                obs = self.env_test.reset(cube_start_pos=cube_start_pos, cube_start_orn=cube_start_orn)
+            else:
+                obs = self.env_test.reset()
+            
+            policy.reset()
+
+            reward_sum = 0.0
+            done = False
+            final_goal_dist = 0.0
+
+            collect_frames = self.save_local_videos or (self.log_wandb_videos and episode_id == 0)
+            episode_cam0_frames = []
+            episode_cam1_frames = []
+            if collect_frames:
+                episode_cam0_frames.append(self.env_test.env.render_camera(0))
+                episode_cam1_frames.append(self.env_test.env.render_camera(1))
+
+            while not done:
+                policy_obs = self._to_policy_obs(obs, policy, device)
+
+                with torch.no_grad():
+                    action_dict = policy.predict_action(policy_obs)
+                action = dict_apply(action_dict, lambda x: x.detach().cpu().numpy())["action"]
+
+                if action.ndim == 3:
+                    action = action.squeeze(0)
+                
+                action_seq = action[: self.n_action_steps]
+                obs, reward, done, info = self.env_test.step(action_seq)
+                reward_sum += float(reward)
+                
+                # Check goal dist (cube to tray center)
+                if hasattr(self.env_test.env, 'tray_pos'):
+                    tray_pos = self.env_test.env.tray_pos
+                    import pybullet as p
+                    if self.env_test.env.cube_id is not None:
+                        cube_pos, _ = p.getBasePositionAndOrientation(self.env_test.env.cube_id)
+                        final_goal_dist = np.linalg.norm(np.array(cube_pos[:2]) - np.array(tray_pos[:2]))
+
+                if collect_frames:
+                    episode_cam0_frames.append(self.env_test.env.render_camera(0))
+                    episode_cam1_frames.append(self.env_test.env.render_camera(1))
+
+            all_returns_test.append(reward_sum)
+            all_success_rates_test.append(1.0 if self.env_test.env.is_success() else 0.0)
+            all_collision_rates_test.append(1.0 if (hasattr(self.env_test.env, 'collision_flag') and self.env_test.env.collision_flag) else 0.0)
+            final_goal_dists.append(final_goal_dist)
+
+            if self.log_wandb_videos and episode_id == 0 and len(episode_cam0_frames) > 0:
+                cam0_first_episode = self._annotate_frames_with_final_error(episode_cam0_frames, final_goal_dist)
+                cam1_first_episode = self._annotate_frames_with_final_error(episode_cam1_frames, final_goal_dist)
+
+            if self.save_local_videos and len(episode_cam0_frames) > 0:
+                if self.save_all_local_episodes or (episode_id == 0):
+                    saved_paths = self._save_local_episode_videos(
+                        episode_id=episode_id,
+                        cam0_frames=episode_cam0_frames,
+                        cam1_frames=episode_cam1_frames,
+                        collided=(hasattr(self.env_test.env, 'collision_flag') and self.env_test.env.collision_flag),
+                        final_goal_dist=final_goal_dist,
+                    )
+                    saved_local_videos.extend(saved_paths)
+
+            print(f"Lite6 PickPlace Episode {episode_id}: Reward={reward_sum:.2f}, Success={self.env_test.env.is_success()}")
+
+        sr_mean = float(np.mean(all_success_rates_test)) if len(all_success_rates_test) > 0 else 0.0
+        returns_mean = float(np.mean(all_returns_test)) if len(all_returns_test) > 0 else 0.0
+        
+        log_data = {
+            "mean_success_rates_test": sr_mean,
+            "mean_returns_test": returns_mean,
+            "test_mean_score": sr_mean,
+        }
+
+        if self.log_wandb_videos and len(cam0_first_episode) > 0:
+            import wandb
+            cam0 = np.stack(cam0_first_episode, axis=0)
+            cam1 = np.stack(cam1_first_episode, axis=0)
+            merged = np.concatenate([cam0, cam1], axis=2).transpose(0, 3, 1, 2)
+            log_data["sim_video_cam01_merged_test"] = wandb.Video(
+                merged.astype(np.uint8), fps=self.fps, format="mp4"
+            )
+
+        return log_data
         self.episode_test = n_test
         self.logger_util_test = logger_util.LargestKRecorder(K=3)
 
@@ -586,62 +696,9 @@ class UR5PyBulletRunner(BaseRunner):
         return log_data
 
 
-class Lite6MotionPlanningRunner(BaseRunner):
-    def __init__(
-        self,
-        output_dir,
-        n_test=5,
-        max_steps=350,
-        n_obs_steps=1,
-        n_action_steps=12,
-        fps=10,
-        use_gui=False,
-        num_points=5000,
-        image_size=224,
-        action_dim=7,
-        collision_terminate=False,
-        collision_distance_threshold=0.01,
-        success_threshold=0.03,
-        max_steps_per_waypoint=10,
-        waypoint_threshold=0.01,
-        log_wandb_videos=True,
-        save_local_videos=False,
-        save_all_local_episodes=False,
-        merge_cams_side_by_side=True,
-        local_video_dir="rollout_videos",
-    ):
+class Lite6BaseRunner(BaseRunner):
+    def __init__(self, output_dir):
         super().__init__(output_dir)
-        self.episode_test = n_test
-        self.max_steps = max_steps
-        self.n_obs_steps = n_obs_steps
-        self.n_action_steps = n_action_steps
-        self.fps = fps
-        self.action_dim = action_dim
-        self.logger_util_test = logger_util.LargestKRecorder(K=3)
-        self.log_wandb_videos = log_wandb_videos
-        self.save_local_videos = save_local_videos
-        self.save_all_local_episodes = save_all_local_episodes
-        self.merge_cams_side_by_side = merge_cams_side_by_side
-        self.local_video_dir = local_video_dir
-
-        self.env_test = MultiStepWrapper(
-            Lite6MotionPlanningEnv(
-                use_gui=use_gui,
-                num_points=num_points,
-                image_size=image_size,
-                action_dim=action_dim,
-                max_steps=max_steps,
-                collision_terminate=collision_terminate,
-                collision_distance_threshold=collision_distance_threshold,
-                success_threshold=success_threshold,
-                max_steps_per_waypoint=max_steps_per_waypoint,
-                waypoint_threshold=waypoint_threshold,
-            ),
-            n_obs_steps=n_obs_steps,
-            n_action_steps=n_action_steps,
-            max_episode_steps=max_steps,
-            reward_agg_method="sum",
-        )
 
     def _to_policy_obs(self, stacked_obs, policy, device):
         policy_obs = {}
@@ -651,6 +708,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
             if key not in stacked_obs:
                 continue
             tensor = torch.from_numpy(stacked_obs[key]).to(device=device, non_blocking=True)
+            # Some policies expect (1, T, D)
             policy_obs[key] = tensor.unsqueeze(0)
         return policy_obs
 
@@ -700,7 +758,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
     def _annotate_frames_with_final_error(self, frames, final_goal_dist):
         if len(frames) == 0 or final_goal_dist is None:
             return frames
-        text = f"Final EEF error: {final_goal_dist:.3f} m"
+        text = f"Final error: {final_goal_dist:.3f} m"
         return [self._overlay_text(frame, text) for frame in frames]
 
     def _save_local_episode_videos(self, episode_id, cam0_frames, cam1_frames, collided, final_goal_dist=None):
@@ -729,6 +787,71 @@ class Lite6MotionPlanningRunner(BaseRunner):
         self._write_rgb_video(cam1_frames, cam1_path)
         return [cam0_path, cam1_path]
 
+
+class Lite6MotionPlanningRunner(Lite6BaseRunner):
+    def __init__(
+        self,
+        output_dir,
+        n_test=5,
+        max_steps=350,
+        n_obs_steps=1,
+        n_action_steps=12,
+        fps=10,
+        use_gui=False,
+        num_points=5000,
+        image_size=224,
+        action_dim=7,
+        collision_terminate=False,
+        collision_distance_threshold=0.01,
+        success_threshold=0.03,
+        max_steps_per_waypoint=10,
+        waypoint_threshold=0.01,
+        sim_freq=60,
+        obstacle_max_top_z=None,
+        log_wandb_videos=True,
+        save_local_videos=False,
+        save_all_local_episodes=False,
+        merge_cams_side_by_side=True,
+        local_video_dir="rollout_videos",
+    ):
+        super().__init__(output_dir)
+        self.episode_test = n_test
+        self.max_steps = max_steps
+        self.n_obs_steps = n_obs_steps
+        self.n_action_steps = n_action_steps
+        self.fps = fps
+        self.action_dim = action_dim
+        self.logger_util_test = logger_util.LargestKRecorder(K=3)
+        self.log_wandb_videos = log_wandb_videos
+        self.save_local_videos = save_local_videos
+        self.save_all_local_episodes = save_all_local_episodes
+        self.merge_cams_side_by_side = merge_cams_side_by_side
+        self.local_video_dir = local_video_dir
+
+        self.env_test = MultiStepWrapper(
+            SimpleVideoRecordingWrapper(
+                Lite6MotionPlanningEnv(
+                    use_gui=use_gui,
+                    num_points=num_points,
+                    image_size=image_size,
+                    action_dim=action_dim,
+                    max_steps=max_steps,
+                    collision_terminate=collision_terminate,
+                    collision_distance_threshold=collision_distance_threshold,
+                    success_threshold=success_threshold,
+                    obs_config={"max_top_z": obstacle_max_top_z} if obstacle_max_top_z is not None else None,
+                    max_steps_per_waypoint=max_steps_per_waypoint,
+                    waypoint_threshold=waypoint_threshold,
+                    sim_freq=sim_freq,
+                )
+            ),
+            n_obs_steps=n_obs_steps,
+            n_action_steps=n_action_steps,
+            max_episode_steps=max_steps,
+            reward_agg_method="sum",
+        )
+
+
     def run(self, policy: BasePolicy, dataset=None):
         device = policy.device
         all_returns_test = []
@@ -736,12 +859,36 @@ class Lite6MotionPlanningRunner(BaseRunner):
         all_collision_rates_test = []
         saved_local_videos = []
         final_goal_dists = []
+        obstacle_top_zs = []
 
         cam0_first_episode = []
         cam1_first_episode = []
+        base_env = self.env_test.env.env
+        val_episode_indices = None
+        if dataset is not None and hasattr(dataset, "train_mask"):
+            val_episode_indices = np.where(~dataset.train_mask)[0]
 
         for episode_id in range(self.episode_test):
-            obs = self.env_test.reset()
+            reset_kwargs = {}
+            if dataset is not None and hasattr(dataset, "get_episode_eval_setup"):
+                try:
+                    if val_episode_indices is not None and episode_id < len(val_episode_indices):
+                        dataset_episode_idx = int(val_episode_indices[episode_id])
+                    else:
+                        dataset_episode_idx = episode_id
+                    if dataset_episode_idx < dataset.replay_buffer.n_episodes:
+                        setup = dataset.get_episode_eval_setup(dataset_episode_idx)
+                        reset_kwargs = {
+                            "start_joint": setup["start_joint"],
+                            "start_eef_xyz": setup["start_eef_xyz"],
+                            "goal_eef_xyz": setup["goal_eef_xyz"],
+                            "start_gripper": setup["start_gripper"],
+                        }
+                except Exception as exc:
+                    cprint(f"Motion-plan eval falling back to random reset: {exc}", "yellow")
+                    reset_kwargs = {}
+
+            obs = self.env_test.reset(**reset_kwargs)
             policy.reset()
 
             reward_sum = 0.0
@@ -752,8 +899,8 @@ class Lite6MotionPlanningRunner(BaseRunner):
             episode_cam0_frames = []
             episode_cam1_frames = []
             if collect_frames:
-                episode_cam0_frames.append(self.env_test.env.render_camera(0))
-                episode_cam1_frames.append(self.env_test.env.render_camera(1))
+                episode_cam0_frames.append(base_env.render_camera(0))
+                episode_cam1_frames.append(base_env.render_camera(1))
 
             while not done:
                 policy_obs = self._to_policy_obs(obs, policy, device)
@@ -773,13 +920,16 @@ class Lite6MotionPlanningRunner(BaseRunner):
                 final_goal_dist = float(info.get("goal_dist", final_goal_dist))
 
                 if collect_frames:
-                    episode_cam0_frames.append(self.env_test.env.render_camera(0))
-                    episode_cam1_frames.append(self.env_test.env.render_camera(1))
+                    episode_cam0_frames.append(base_env.render_camera(0))
+                    episode_cam1_frames.append(base_env.render_camera(1))
 
             all_returns_test.append(reward_sum)
-            all_success_rates_test.append(1.0 if self.env_test.env.is_success() else 0.0)
-            all_collision_rates_test.append(1.0 if self.env_test.env.collision_flag else 0.0)
+            all_success_rates_test.append(1.0 if base_env.is_success() else 0.0)
+            all_collision_rates_test.append(1.0 if base_env.collision_flag else 0.0)
             final_goal_dists.append(final_goal_dist)
+            obstacle_top_z = getattr(base_env, "last_obstacle_info", {}).get("top_z", None)
+            if obstacle_top_z is not None:
+                obstacle_top_zs.append(float(obstacle_top_z))
 
             if self.log_wandb_videos and episode_id == 0 and len(episode_cam0_frames) > 0:
                 cam0_first_episode = self._annotate_frames_with_final_error(episode_cam0_frames, final_goal_dist)
@@ -791,13 +941,13 @@ class Lite6MotionPlanningRunner(BaseRunner):
                         episode_id=episode_id,
                         cam0_frames=episode_cam0_frames,
                         cam1_frames=episode_cam1_frames,
-                        collided=self.env_test.env.collision_flag,
+                        collided=base_env.collision_flag,
                         final_goal_dist=final_goal_dist,
                     )
                     saved_local_videos.extend(saved_paths)
 
             cprint(
-                f"Lite6 Test Episode {episode_id}: Reward={reward_sum:.2f}, Success={self.env_test.env.is_success()}, Collision={self.env_test.env.collision_flag}",
+                f"Lite6 Test Episode {episode_id}: Reward={reward_sum:.2f}, Success={base_env.is_success()}, Collision={base_env.collision_flag}, GoalDist={final_goal_dist}, ObstacleTopZ={obstacle_top_z}",
                 "yellow",
             )
 
@@ -805,6 +955,7 @@ class Lite6MotionPlanningRunner(BaseRunner):
         returns_mean = float(np.mean(all_returns_test)) if len(all_returns_test) > 0 else 0.0
         collision_mean = float(np.mean(all_collision_rates_test)) if len(all_collision_rates_test) > 0 else 0.0
         final_goal_dist_mean = float(np.mean([d for d in final_goal_dists if d is not None])) if any(d is not None for d in final_goal_dists) else None
+        obstacle_top_z_mean = float(np.mean(obstacle_top_zs)) if len(obstacle_top_zs) > 0 else None
         self.logger_util_test.record(sr_mean)
 
         log_data = {
@@ -817,6 +968,8 @@ class Lite6MotionPlanningRunner(BaseRunner):
 
         if final_goal_dist_mean is not None:
             log_data["mean_final_goal_dist_test"] = final_goal_dist_mean
+        if obstacle_top_z_mean is not None:
+            log_data["mean_obstacle_top_z_test"] = obstacle_top_z_mean
 
         if len(saved_local_videos) > 0:
             cprint(f"Saved {len(saved_local_videos)} rollout videos to {os.path.join(self.output_dir, self.local_video_dir)}", "cyan")
@@ -830,11 +983,18 @@ class Lite6MotionPlanningRunner(BaseRunner):
             log_data["sim_video_cam01_merged_test"] = wandb.Video(
                 merged.astype(np.uint8), fps=self.fps, format="mp4"
             )
+            try:
+                videos_test = self.env_test.env.get_video()
+                log_data["sim_video_test"] = wandb.Video(
+                    videos_test.astype(np.uint8), fps=self.fps, format="mp4"
+                )
+            except Exception as exc:
+                cprint(f"Motion-plan video capture failed: {exc}", "yellow")
 
         return log_data
 
 
-class Lite6PickPlaceRunner(UR5PyBulletRunner):
+class Lite6PickPlaceRunner(Lite6BaseRunner):
     def __init__(
         self,
         output_dir,
@@ -853,24 +1013,27 @@ class Lite6PickPlaceRunner(UR5PyBulletRunner):
         capture_table=False,
         use_workspace_crop=True,
         workspace_std=30.0,
+        log_wandb_videos=True,
+        save_local_videos=False,
+        save_all_local_episodes=False,
+        merge_cams_side_by_side=True,
+        local_video_dir="rollout_videos",
     ):
-        # We call UR5PyBulletRunner's init but then override the env_test
-        super().__init__(
-            output_dir=output_dir,
-            n_train=n_train,
-            n_test=n_test,
-            max_steps=max_steps,
-            n_obs_steps=n_obs_steps,
-            n_action_steps=n_action_steps,
-            fps=fps,
-            use_gui=use_gui,
-            num_points=num_points,
-            image_size=image_size,
-            action_dim=action_dim,
-            use_workspace_crop=use_workspace_crop,
-            workspace_std=workspace_std,
-            capture_table=capture_table,
-        )
+        super().__init__(output_dir)
+        self.episode_test = n_test
+        self.max_steps = max_steps
+        self.n_obs_steps = n_obs_steps
+        self.n_action_steps = n_action_steps
+        self.fps = fps
+        self.action_dim = action_dim
+        self.num_points = num_points
+        self.logger_util_test = logger_util.LargestKRecorder(K=3)
+        self.log_wandb_videos = log_wandb_videos
+        self.save_local_videos = save_local_videos
+        self.save_all_local_episodes = save_all_local_episodes
+        self.merge_cams_side_by_side = merge_cams_side_by_side
+        self.local_video_dir = local_video_dir
+        self.include_gripper = (action_dim == 7 or action_dim == 13)
 
         from diffusion_policy_3d.env.pybullet.pybullet_wrapper import Lite6PickPlaceEnv
 
@@ -894,3 +1057,123 @@ class Lite6PickPlaceRunner(UR5PyBulletRunner):
             )
         
         self.env_test = env_fn()
+
+    def run(self, policy: BasePolicy, dataset=None):
+        device = policy.device
+        all_returns_test = []
+        all_success_rates_test = []
+        final_goal_dists = []
+        saved_local_videos = []
+        wandb_video = None
+
+        base_env = self.env_test.env.env
+        val_episode_indices = None
+        if dataset is not None and hasattr(dataset, "train_mask"):
+            val_episode_indices = np.where(~dataset.train_mask)[0]
+
+        for episode_id in range(self.episode_test):
+            cube_start_pos = None
+            cube_start_orn = None
+            if dataset is not None and hasattr(dataset, "get_episode_cube_start_pos"):
+                try:
+                    if val_episode_indices is not None and episode_id < len(val_episode_indices):
+                        dataset_episode_idx = int(val_episode_indices[episode_id])
+                    else:
+                        dataset_episode_idx = episode_id
+                    if dataset_episode_idx < dataset.replay_buffer.n_episodes:
+                        cube_info = dataset.get_episode_cube_start_pos(dataset_episode_idx)
+                        cube_start_pos = cube_info[:3].tolist()
+                        cube_start_orn = cube_info[3:7].tolist()
+                except Exception as exc:
+                    cprint(f"PickPlace eval falling back to default cube pose: {exc}", "yellow")
+                    cube_start_pos = None
+                    cube_start_orn = None
+
+            obs = self.env_test.reset(
+                cube_start_pos=cube_start_pos,
+                cube_start_orn=cube_start_orn,
+            )
+            policy.reset()
+
+            reward_sum = 0.0
+            done = False
+            final_goal_dist = None
+
+            while not done:
+                policy_obs = self._to_policy_obs(obs, policy, device)
+                with torch.no_grad():
+                    action_dict = policy.predict_action(policy_obs)
+                action = dict_apply(action_dict, lambda x: x.detach().cpu().numpy())["action"]
+
+                if action.ndim == 3:
+                    action = action.squeeze(0)
+                elif action.ndim == 1:
+                    action = action[None, :]
+
+                action_seq = action[: self.n_action_steps]
+                obs, reward, done, info = self.env_test.step(action_seq)
+                reward_sum += float(reward)
+                done = bool(np.all(done))
+
+                if base_env.cube_id is not None:
+                    import pybullet as p
+                    cube_pos, _ = p.getBasePositionAndOrientation(base_env.cube_id)
+                    final_goal_dist = float(
+                        np.linalg.norm(np.array(cube_pos[:2]) - np.array([0.30, 0.20]))
+                    )
+
+            success = 1.0 if base_env.is_success() else 0.0
+            all_returns_test.append(reward_sum)
+            all_success_rates_test.append(success)
+            final_goal_dists.append(final_goal_dist)
+
+            if self.log_wandb_videos and episode_id == 0:
+                try:
+                    wandb_video = self.env_test.env.get_video()
+                except Exception as exc:
+                    cprint(f"PickPlace video capture failed: {exc}", "yellow")
+
+            if self.save_local_videos:
+                try:
+                    frames = self.env_test.env.get_video().transpose(0, 2, 3, 1)
+                    frames = self._annotate_frames_with_final_error(list(frames), final_goal_dist)
+                    out_dir = os.path.join(self.output_dir, self.local_video_dir)
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, f"pick_place_episode_{episode_id:03d}.mp4")
+                    if self._write_rgb_video(frames, out_path):
+                        saved_local_videos.append(out_path)
+                except Exception as exc:
+                    cprint(f"PickPlace local video save failed: {exc}", "yellow")
+
+            cprint(
+                f"Lite6 PickPlace Episode {episode_id}: Reward={reward_sum:.2f}, "
+                f"Success={bool(success)}, Final XY error={final_goal_dist}",
+                "yellow",
+            )
+
+        sr_mean = float(np.mean(all_success_rates_test)) if all_success_rates_test else 0.0
+        returns_mean = float(np.mean(all_returns_test)) if all_returns_test else 0.0
+        final_goal_dist_mean = (
+            float(np.mean([d for d in final_goal_dists if d is not None]))
+            if any(d is not None for d in final_goal_dists)
+            else None
+        )
+        self.logger_util_test.record(sr_mean)
+
+        log_data = {
+            "mean_success_rates_test": sr_mean,
+            "mean_returns_test": returns_mean,
+            "SR_test_L3": self.logger_util_test.average_of_largest_K(),
+            "test_mean_score": sr_mean,
+        }
+        if final_goal_dist_mean is not None:
+            log_data["mean_final_goal_dist_test"] = final_goal_dist_mean
+        if len(saved_local_videos) > 0:
+            log_data["local_rollout_video_dir_test"] = os.path.join(self.output_dir, self.local_video_dir)
+            log_data["local_rollout_video_count_test"] = int(len(saved_local_videos))
+        if wandb_video is not None:
+            log_data["sim_video_test"] = wandb.Video(
+                wandb_video.astype(np.uint8), fps=self.fps, format="mp4"
+            )
+
+        return log_data

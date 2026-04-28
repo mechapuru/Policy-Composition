@@ -534,13 +534,20 @@ class TrainDP3Workspace:
     #     return runner_log
 
     def eval(self):
-        # load the latest checkpoint
-        print("Hellooooooo")
         cfg = copy.deepcopy(self.cfg)
-        lastest_ckpt_path = "/scratch2/cross-emb/DP3_outputs/2026.04.16/21.18.38_train_dp3_motionplan_test/checkpoints/epoch=0200-test_mean_score=0.500.ckpt"
-        print(f"Checkpoint is loaded from : {lastest_ckpt_path}")
+        default_ckpt_by_task = {
+            "pick_place": "/scratch3/cross-emb/DP3_output/pybullet_pick_place-dp3-N24Aprill_PP_2_seed42/checkpoints/latest.ckpt",
+            "motion_plan": "/scratch3/cross-emb/DP3_output/pybullet_motion_plan-dp3-N24April_MP_2_seed42/checkpoints/latest.ckpt",
+        }
+        ckpt_path = OmegaConf.select(cfg, "eval.ckpt_path", default=None)
+        if ckpt_path is None:
+            task_name = OmegaConf.select(cfg, "task.task_name", default=None)
+            ckpt_path = default_ckpt_by_task.get(task_name)
+        if ckpt_path is None:
+            raise ValueError("No eval checkpoint configured. Pass +eval.ckpt_path=/path/to/checkpoint.ckpt")
 
-        self.load_checkpoint(path=lastest_ckpt_path)
+        print(f"Checkpoint is loaded from : {ckpt_path}")
+        self.load_checkpoint(path=ckpt_path)
 
         # Load dataset
         dataset: BaseDataset = hydra.utils.instantiate(cfg.task.dataset)

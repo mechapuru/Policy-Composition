@@ -25,7 +25,7 @@ class DroidDataset(BaseDataset):
         super().__init__()
         self.task_name = task_name
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['state', 'action', 'point_cloud', 'img'])
+            zarr_path, keys=['state', 'action', 'point_cloud'])
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes,
             val_ratio=val_ratio,
@@ -74,23 +74,24 @@ class DroidDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        agent_pos = sample['state'][:,].astype(np.float32) # (T, 13)
-        point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 2500, 6)
+        # sample['state'] was stored as (N, 7) in our Lite6 create_zarr script
+        agent_pos = sample['state'][:, :7].astype(np.float32) # (T, 7)
+        # Slicing to match shape_meta: [2500, 3]
+        point_cloud = sample['point_cloud'][:, :2500, :3].astype(np.float32) # (T, 2500, 3)
         
         if 'cube_pos' in sample:
             cube_pos = sample['cube_pos'][:,].astype(np.float32) # (T, 7)
         else:
-            # Fixed start position OR current pose (joints + gripper) as requested
             # Defaulting to current agent_pos (first 7 dims)
             cube_pos = agent_pos[:, :7].copy()
 
         data = {
             'obs': {
-                'point_cloud': point_cloud, # T, 2500, 6
-                'agent_pos': agent_pos, # T, 13
+                'point_cloud': point_cloud, # (T, 2500, 3)
+                'agent_pos': agent_pos, # (T, 7)
             },
-            'action': sample['action'].astype(np.float32), # T, 13
-            'cube_pos': cube_pos, # T, 7 - cube position and orientation
+            'action': sample['action'][:, :7].astype(np.float32), # (T, 7)
+            'cube_pos': cube_pos, # (T, 7) - cube position and orientation
         }
         return data
 
@@ -111,8 +112,8 @@ class DroidDataset(BaseDataset):
         if 'cube_pos' in self.replay_buffer:
             cube_pos = self.replay_buffer['cube_pos'][episode_start_idx].astype(np.float32)
         else:
-            # Default to agent position (joints + gripper)
-            cube_pos = self.replay_buffer['state'][episode_start_idx][:7].astype(np.float32)
+            # Matches the fixed cube spawn in pick_and_place_xarm6_for_poco.py.
+            cube_pos = np.array([0.3, -0.2, 0.65, 0, 0, 0, 1], dtype=np.float32)
         return cube_pos  # Returns [x, y, z, qx, qy, qz, qw]
     
     def get_episode(self, episode_idx: int):
