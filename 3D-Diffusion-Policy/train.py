@@ -536,7 +536,7 @@ class TrainDP3Workspace:
     def eval(self):
         cfg = copy.deepcopy(self.cfg)
         default_ckpt_by_task = {
-            "pick_place": "/scratch3/cross-emb/DP3_output/pybullet_pick_place-dp3-N24Aprill_PP_2_seed42/checkpoints/latest.ckpt",
+            "pick_place": "/scratch3/cross-emb/DP3_output/pybullet_pick_place-dp3-N24Aprill_PP_2_seed42/checkpoints/epoch=0250.ckpt",
             "motion_plan": "/scratch3/cross-emb/DP3_output/pybullet_motion_plan-dp3-N24April_MP_2_seed42/checkpoints/latest.ckpt",
         }
         ckpt_path = OmegaConf.select(cfg, "eval.ckpt_path", default=None)

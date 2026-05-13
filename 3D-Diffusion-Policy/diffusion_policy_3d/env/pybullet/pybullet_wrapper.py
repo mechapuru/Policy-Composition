@@ -1223,6 +1223,29 @@ class Lite6Robot:
             if abs(current_pos - prismatic_target) < 2e-3:
                 break
 
+    def get_gripper_raw_angle(self):
+        """Return raw left_finger_joint position in meters."""
+        return p.getJointState(self.id, self.mimic_parent_id)[0]
+
+    def command_gripper_target(self, target_pos, force=500):
+        """Send a single position-control command to parent + mimic child joints."""
+        target_pos = float(np.clip(target_pos, self.gripper_range[0], self.gripper_range[1]))
+        p.setJointMotorControl2(
+            self.id,
+            self.mimic_parent_id,
+            p.POSITION_CONTROL,
+            targetPosition=target_pos,
+            force=force,
+        )
+        for joint_id, multiplier in self.mimic_child_multiplier.items():
+            p.setJointMotorControl2(
+                self.id,
+                joint_id,
+                p.POSITION_CONTROL,
+                targetPosition=target_pos * multiplier,
+                force=force,
+            )
+
     def reset_posture(self, initial_orn_euler=[3.14, 0, 0]):
         """Robustly reset the robot to the initial pose and gripper open."""
         # Initial reset posture
@@ -1656,6 +1679,8 @@ class Lite6PickPlaceEnv(gym.Env):
         obs_config=None,
         max_steps_per_waypoint=4,
         waypoint_threshold=0.02,
+        sim_freq=240,
+        sim_substeps=1,
     ):
         self.use_gui = use_gui
         self.num_points = num_points
@@ -1666,11 +1691,13 @@ class Lite6PickPlaceEnv(gym.Env):
         self.obs_config = obs_config or {}
         self.max_steps_per_waypoint = max_steps_per_waypoint
         self.waypoint_threshold = waypoint_threshold
+        self.sim_freq = sim_freq
+        self.sim_substeps = sim_substeps
 
         self.physics_client = p.connect(p.GUI if use_gui else p.DIRECT)
         p.setGravity(0, 0, -9.8)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setTimeStep(1/240)
+        p.setTimeStep(1.0 / float(self.sim_freq))
 
         self.plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
         self.table_id = p.loadURDF("table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0]))
@@ -1681,7 +1708,18 @@ class Lite6PickPlaceEnv(gym.Env):
         self.cube_id = None
         self.tray_id = None
         self.is_success_flag = False
+        self.success_pending = False
+        self.success_hold_counter = 0
+        self.post_success_steps_remaining = 0
         self.last_cam_frames = {}
+        self.episode_frames = []
+
+        # Match XArm6GripperEnv close/open trigger semantics.
+        self.gripper_close_delta_thresh = 0.1
+        self.gripper_open_delta_thresh = -0.05
+        self.success_gripper_open_threshold = float(self.obs_config.get("success_gripper_open_threshold", 0.2))
+        self.success_hold_steps = int(self.obs_config.get("success_hold_steps", 3))
+        self.post_success_hold_steps = int(self.obs_config.get("post_success_hold_steps", 25))
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
         self.observation_space = spaces.Dict(
@@ -1737,6 +1775,10 @@ class Lite6PickPlaceEnv(gym.Env):
     def reset(self, cube_start_pos=None, cube_start_orn=None):
         self.current_step = 0
         self.is_success_flag = False
+        self.success_pending = False
+        self.success_hold_counter = 0
+        self.post_success_steps_remaining = 0
+        self.episode_frames = []
 
         if self.cube_id is not None:
              p.removeBody(self.cube_id)
@@ -1746,7 +1788,7 @@ class Lite6PickPlaceEnv(gym.Env):
         self.robot.reset_posture()
 
         # Match script: [0.30, 0.20, 0.625]
-        tray_pos = [0.30, 0.20, 0.625] 
+        tray_pos = [0.30, 0.20, 0.625]
         cylinder_radius = 0.05
         cylinder_height = 0.04
         
@@ -1763,7 +1805,10 @@ class Lite6PickPlaceEnv(gym.Env):
             baseVisualShapeIndex=visual_shape,
             basePosition=[tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height/2]
         )
+        # Store cylinder/tray parameters for later success checks
+        self.cylinder_pos = tray_pos
         self.cylinder_radius = cylinder_radius
+        self.cylinder_height = cylinder_height
         self.cylinder_top_z = tray_pos[2] + cylinder_height
 
         # Load cube
@@ -1781,7 +1826,36 @@ class Lite6PickPlaceEnv(gym.Env):
         for _ in range(50):
             p.stepSimulation()
 
-        return self._get_obs()
+        obs = self._get_obs()
+        self.episode_frames.append(obs["image"].transpose(1, 2, 0).copy())
+        return obs
+
+    def _apply_gripper_delta(self, gripper_delta: float):
+        """
+        Apply thresholded gripper control:
+          delta > 0.1   -> keep closing until grasp/closed
+          delta < -0.05 -> keep opening until near fully open
+          otherwise     -> hold
+        """
+        if gripper_delta > self.gripper_close_delta_thresh:
+            max_iters = 100
+            close_target = self.robot.gripper_range[1]  # 0.0 (closed)
+            for _ in range(max_iters):
+                self.robot.command_gripper_target(close_target)
+                p.stepSimulation()
+                raw_pos = self.robot.get_gripper_raw_angle()
+                norm_state = float(self.robot.get_robot_state()[-1])
+                if norm_state >= 1.0 or raw_pos > -0.024:
+                    break
+        elif gripper_delta < self.gripper_open_delta_thresh:
+            max_iters = 100
+            open_target = self.robot.gripper_range[0]  # -0.04 (open)
+            self.robot.command_gripper_target(open_target)
+            for _ in range(max_iters):
+                p.stepSimulation()
+                raw_pos = self.robot.get_gripper_raw_angle()
+                if raw_pos <= -0.039:
+                    break
 
     def _get_obs(self):
         pc = self._build_point_cloud()
@@ -1796,13 +1870,12 @@ class Lite6PickPlaceEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] != 7:
+            raise ValueError(f"Lite6PickPlaceEnv expects 7D action, got {action.shape}")
         
         target_arm = action[:6]
-        gripper_cmd_dataset = float(action[6])
-
-        current_gripper = self.robot.get_robot_state()[-1]
-        target_gripper = current_gripper + gripper_cmd_dataset
-        self.robot.move_gripper(self.robot.dataset_gripper_to_joint(target_gripper))
+        gripper_delta = float(action[6])
+        self._apply_gripper_delta(gripper_delta)
         
         # Similar to MP step but simplified for PP
         for _ in range(self.max_steps_per_waypoint):
@@ -1816,32 +1889,70 @@ class Lite6PickPlaceEnv(gym.Env):
                     maxVelocity=self.robot.max_velocity,
                 )
 
-            p.stepSimulation()
+            for _ in range(self.sim_substeps):
+                p.stepSimulation()
 
-        # Success check: cube on cylinder (dist < radius) and resting on its surface
+        # Success check: cube on cylinder and gripper released/opened.
         reward = 0.0
         done = False
         cube_pos, _ = p.getBasePositionAndOrientation(self.cube_id)
-        dist_to_center = np.linalg.norm(np.array(cube_pos[:2]) - np.array([0.30, 0.20]))
-        
-        # Match script condition exactly
-        inside_tray = dist_to_center < self.cylinder_radius and cube_pos[2] > self.cylinder_top_z + 0.01
-        
-        if inside_tray:
-            reward = 1.0
-            self.is_success_flag = True
-            done = True
+        dist_to_center = np.linalg.norm(np.array(cube_pos[:2]) - np.array(self.cylinder_pos[:2]))
+
+        aabb_min, aabb_max = p.getAABB(self.cube_id)
+        cube_half_height = 0.5 * (aabb_max[2] - aabb_min[2])
+        z_target = self.cylinder_top_z + cube_half_height
+        z_tol = 0.001  # tune from physics jitter
+        on_top = abs(cube_pos[2] - z_target) <= z_tol
+        inside_tray = dist_to_center < self.cylinder_radius
+        gripper_open = float(self.robot.get_robot_state()[-1]) <= self.success_gripper_open_threshold
+
+        print(
+            f"Step {self.current_step}: Cube pos {cube_pos}, dist to center {dist_to_center:.4f}, "
+            f"on_top {on_top}, inside_tray {inside_tray}, gripper_open {gripper_open}, "
+            f"pending {self.success_pending}, hold {self.success_hold_counter}"
+        )
+
+        placed = inside_tray and on_top
+        if placed:
+            self.success_pending = True
+
+        if self.success_pending and placed and gripper_open:
+            self.success_hold_counter += 1
+        else:
+            self.success_hold_counter = 0
+
+        if self.success_pending and self.success_hold_counter >= self.success_hold_steps:
+            if not self.is_success_flag:  # Only trigger once on first detection
+                reward = 1.0
+                self.is_success_flag = True
+                # Enter post-success phase instead of immediately ending
+                self.post_success_steps_remaining = self.post_success_hold_steps
+                print(f"Step {self.current_step}: Success detected! Holding for {self.post_success_hold_steps} more steps.")
+
+        # Decrement post-success counter and end episode when it reaches zero
+        if self.post_success_steps_remaining > 0:
+            self.post_success_steps_remaining -= 1
+            if self.post_success_steps_remaining == 0:
+                done = True
+                print(f"Step {self.current_step}: Post-success hold complete. Episode ending.")
 
         if self.current_step >= self.max_steps:
             done = True
 
-        return self._get_obs(), reward, done, {"is_success": self.is_success_flag}
+        obs = self._get_obs()
+        self.episode_frames.append(obs["image"].transpose(1, 2, 0).copy())
+        return obs, reward, done, {"is_success": self.is_success_flag}
 
     def is_success(self):
         return self.is_success_flag
 
     def get_video(self):
-        return self.render_camera()
+        if len(self.episode_frames) == 0:
+            frame = self.render_camera()
+            video = np.expand_dims(frame, axis=0)
+        else:
+            video = np.stack(self.episode_frames, axis=0)
+        return video.transpose(0, 3, 1, 2).astype(np.uint8, copy=False)
     
     def render_camera(self):
         rgb, _, _, _, _ = self._capture_camera()
